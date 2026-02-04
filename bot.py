@@ -78,6 +78,10 @@ async def upload(client, status_msg, f_info, series=None):
     if os.path.exists(path): os.remove(path)
     await status_msg.edit_text(f"✅ Done: {series or 'Root'}")
 
+@app.on_message(filters.command("start") & filters.user(OWNER))
+async def start(c, m):
+    await m.reply("👋 Ready! Send a file.")
+
 @app.on_message(filters.command("stats") & filters.user(OWNER))
 async def stats(c, m):
     up = str(datetime.timedelta(seconds=int(time.time() - START_TIME)))
