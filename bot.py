@@ -4,11 +4,25 @@ import json
 import asyncio
 import time
 import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ForceReply
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+
+# --- FAKE WEB SERVER FOR KOYEB HEALTH CHECKS ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"I am alive!")
+
+def run_health_server():
+    server = HTTPServer(('0.0.0.0', 8000), HealthCheckHandler)
+    server.serve_forever()
 
 # --- CONFIGURATION ---
 OWNER_ID = int(os.environ.get('OWNER_ID', '0'))
@@ -22,7 +36,7 @@ DRIVE_FOLDER_ID = os.environ.get('DRIVE_FOLDER_ID')
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.FileHandler("bot_log.txt"), logging.StreamHandler()]
+    handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
@@ -85,7 +99,7 @@ def upload_to_drive_logic(file_path, file_name, mime_type, series_name=None):
     try:
         current_parent_id = DRIVE_FOLDER_ID
         if series_name:
-            series_id = create_or_get_folder(service, series_name, DRIVE_FOLDER_ID)
+            series_id = create_get_folder(service, series_name, DRIVE_FOLDER_ID)
             if not series_id: return None, "Failed to create Series Folder"
             current_parent_id = series_id
 
@@ -136,7 +150,6 @@ async def process_workflow(client, status_msg, file_info, series_name=None):
     file_name = file_info['name']
     local_path = f"downloads/{file_name}"
     
-    # 1. Download
     start_time = time.time()
     try:
         await status_msg.edit_text(f"📥 **Downloading...**\n`{file_name}`")
@@ -151,7 +164,6 @@ async def process_workflow(client, status_msg, file_info, series_name=None):
         await status_msg.edit_text(f"❌ Download Failed: {e}")
         return
 
-    # 2. Upload
     await status_msg.edit_text(f"☁️ **Uploading to Drive...**\n`{file_name}`")
     loop = asyncio.get_running_loop()
     result, result_name = await loop.run_in_executor(
@@ -163,7 +175,6 @@ async def process_workflow(client, status_msg, file_info, series_name=None):
         series_name
     )
 
-    # 3. Cleanup & Report
     if result:
         size = int(result.get('size', 0))
         FILES_UPLOADED += 1
@@ -181,8 +192,7 @@ async def process_workflow(client, status_msg, file_info, series_name=None):
 
     if os.path.exists(local_path): os.remove(local_path)
 
-# --- BOT COMMANDS ---
-# !!! IPV6 DISABLED FOR STABILITY !!!
+# --- BOT SETUP ---
 app = Client("bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, ipv6=False)
 
 def is_authorized(func):
@@ -272,4 +282,9 @@ async def series_name_handler(client, message):
 
 if __name__ == '__main__':
     if not os.path.exists("downloads"): os.makedirs("downloads")
+    
+    # Start the fake web server in a separate thread
+    threading.Thread(target=run_health_server, daemon=True).start()
+    
+    # Start the Telegram bot
     app.run()
