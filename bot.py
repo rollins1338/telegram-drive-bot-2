@@ -6,7 +6,7 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload, MediaIoBaseUpload
 
-# Koyeb Health Check
+# Health Check
 def run_health_server():
     HTTPServer(('0.0.0.0', 8000), type('H', (BaseHTTPRequestHandler,), {'do_GET': lambda s: (s.send_response(200), s.end_headers(), s.wfile.write(b"OK"))})).serve_forever()
 threading.Thread(target=run_health_server, daemon=True).start()
@@ -16,7 +16,10 @@ ID, HASH, TOKEN = int(os.getenv('API_ID')), os.getenv('API_HASH'), os.getenv('TE
 DRIVE_ID, OWNER = os.getenv('DRIVE_FOLDER_ID'), int(os.getenv('OWNER_ID', 0))
 START_TIME, FILES, BYTES = time.time(), 0, 0
 app = Client("bot", api_id=ID, api_hash=HASH, bot_token=TOKEN, ipv6=False)
-app.temp_files = {} # Fixes button data size limit
+
+# Storage for grouping media and file names
+ALBUMS = {} 
+app.temp_files = {}
 
 def get_svc():
     try: return build('drive', 'v3', credentials=Credentials.from_authorized_user_info(json.loads(os.getenv('TOKEN_JSON'))))
@@ -44,7 +47,6 @@ def sync_stats(svc, save=False):
     except: pass
 
 def get_folder(svc, name, parent):
-    # Fixed: Uses double quotes to handle names with apostrophes
     clean_name = name.replace('"', '\\"')
     q = f'name="{clean_name}" and "{parent}" in parents and mimeType="application/vnd.google-apps.folder" and trashed=false'
     res = svc.files().list(q=q, fields="files(id)").execute().get('files', [])
@@ -61,65 +63,87 @@ async def prog(current, total, msg, start, name):
         try: await msg.edit_text(f"⏳ **Downloading**\n`{name}`\n[{bar}] {perc:.1f}%\n⚡ {speed/1024/1024:.2f} MB/s")
         except: pass
 
-async def upload_task(client, status_msg, f_info, series=None):
+async def upload_task(client, status_msg, f_list, series=None):
     global FILES, BYTES
-    svc, path, start = get_svc(), f"downloads/{f_info['name']}", time.time()
+    svc = get_svc()
     if not svc: return await status_msg.edit_text("❌ Drive Auth Failed!")
-        
+    
     try:
         loop = asyncio.get_running_loop()
-        await status_msg.edit_text("📂 Preparing Drive Folders...")
+        await status_msg.edit_text("📂 Preparing Drive...")
         parent = await loop.run_in_executor(None, get_folder, svc, series, DRIVE_ID) if series else DRIVE_ID
-        book_dir = await loop.run_in_executor(None, get_folder, svc, f_info['name'].rsplit('.', 1)[0], parent)
         
-        await client.download_media(f_info['msg_id'], file_name=path, progress=prog, progress_args=(status_msg, start, f_info['name']))
-        await status_msg.edit_text("☁️ **Uploading...**")
-        
-        file = await loop.run_in_executor(None, lambda: svc.files().create(
-            body={'name': f_info['name'], 'parents': [book_dir]}, 
-            media_body=MediaFileUpload(path, resumable=True), fields='size').execute())
-        
-        FILES, BYTES = FILES + 1, BYTES + int(file.get('size', 0))
+        for f_info in f_list:
+            path, start = f"downloads/{f_info['name']}", time.time()
+            book_dir = await loop.run_in_executor(None, get_folder, svc, f_info['name'].rsplit('.', 1)[0], parent)
+            
+            await client.download_media(f_info['msg_id'], file_name=path, progress=prog, progress_args=(status_msg, start, f_info['name']))
+            await status_msg.edit_text(f"☁️ **Uploading**\n`{f_info['name']}`")
+            
+            file = await loop.run_in_executor(None, lambda: svc.files().create(
+                body={'name': f_info['name'], 'parents': [book_dir]}, 
+                media_body=MediaFileUpload(path, resumable=True), fields='size').execute())
+            
+            FILES, BYTES = FILES + 1, BYTES + int(file.get('size', 0))
+            if os.path.exists(path): os.remove(path)
+            
         await loop.run_in_executor(None, sync_stats, svc, True)
-        if os.path.exists(path): os.remove(path)
-        await status_msg.edit_text(f"✅ Done: {series or 'Root'}")
+        await status_msg.edit_text(f"✅ Finished {len(f_list)} files in: {series or 'Root'}")
     except Exception as e: await status_msg.edit_text(f"❌ Error: {str(e)}")
 
 @app.on_message(filters.command("start") & filters.user(OWNER))
-async def start_cmd(c, m): await m.reply("👋 Ready! Send a file.")
+async def sc(c, m): await m.reply("👋 Ready! Send a file.")
 
 @app.on_message(filters.command("stats") & filters.user(OWNER))
-async def stats_cmd(c, m):
+async def st(c, m):
     up = str(datetime.timedelta(seconds=int(time.time() - START_TIME)))
     await m.reply(f"⏱ **Uptime:** `{up}`\n📂 **Total Files:** `{FILES}`\n📶 **Total Data:** `{BYTES/1024/1024/1024:.2f} GB`")
 
 @app.on_message(filters.media & filters.user(OWNER))
-async def on_media(c, m):
-    file = getattr(m, m.media.value)
-    name = getattr(file, "file_name", "file")
-    app.temp_files[m.id] = name # Store name here to keep button data small
-    await m.reply(f"📄 {name}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📚 Standalone", callback_data=f"std|{m.id}")], [InlineKeyboardButton("📂 Series", callback_data=f"ser|{m.id}")]]))
+async def om(c, m):
+    f = getattr(m, m.media.value)
+    n = getattr(f, "file_name", "file")
+    
+    # If part of an album, wait and group
+    if m.media_group_id:
+        if m.media_group_id not in ALBUMS:
+            ALBUMS[m.media_group_id] = []
+            async def wait_and_ask():
+                await asyncio.sleep(1.5) # Wait for all files in group
+                f_list = ALBUMS.pop(m.media_group_id)
+                key = f"group_{m.media_group_id}"
+                app.temp_files[key] = f_list
+                await m.reply(f"📦 **Album Detected:** {len(f_list)} files", 
+                              reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📚 Standalone", callback_data=f"std|{key}")], [InlineKeyboardButton("📂 Series", callback_data=f"ser|{key}")]]))
+            asyncio.create_task(wait_and_ask())
+        ALBUMS[m.media_group_id].append({'msg_id': m.id, 'name': n})
+    else:
+        # Single file logic
+        app.temp_files[m.id] = [{'msg_id': m.id, 'name': n}]
+        await m.reply(f"📄 {n}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📚 Standalone", callback_data=f"std|{m.id}")], [InlineKeyboardButton("📂 Series", callback_data=f"ser|{m.id}")]]))
 
 @app.on_callback_query()
 async def cb(c, q):
-    mode, mid = q.data.split('|')
-    mid = int(mid)
-    if mid not in app.temp_files: return await q.answer("❌ File data lost. Send file again.", show_alert=True)
-    f_info = {'msg_id': mid, 'name': app.temp_files[mid]}
+    mode, key = q.data.split('|')
+    try: key = int(key)
+    except: pass # It's a string for group IDs
+    
+    if key not in app.temp_files: return await q.answer("❌ Session lost.", show_alert=True)
+    f_list = app.temp_files[key]
     
     if mode == "std":
-        await q.message.edit_text("⏳ Starting Standalone...")
-        asyncio.create_task(upload_task(c, q.message, f_info))
+        await q.message.edit_text(f"⏳ Processing {len(f_list)} files...")
+        asyncio.create_task(upload_task(c, q.message, f_list))
     else:
-        await q.message.edit_text("✍️ Send the Series Name now")
-        app.active_request = f_info
+        await q.message.edit_text("✍️ Send Series Name now")
+        app.active = f_list
 
 @app.on_message(filters.text & filters.user(OWNER) & ~filters.command(["start", "stats"]))
-async def on_text(c, m):
-    if hasattr(app, 'active_request'):
-        f_info, app.active_request = app.active_request, None
-        status = await m.reply("📂 Preparing Drive Folders...")
-        asyncio.create_task(upload_task(c, status, f_info, m.text.strip()))
+async def ot(c, m):
+    if hasattr(app, 'active'):
+        f_list, app.active = app.active, None
+        status = await m.reply("📂 Preparing Folders...")
+        asyncio.create_task(upload_task(c, status, f_list, m.text.strip()))
 
 if __name__ == "__main__":
     if not os.path.exists("downloads"): os.makedirs("downloads")
