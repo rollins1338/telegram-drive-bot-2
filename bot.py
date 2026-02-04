@@ -443,9 +443,8 @@ async def start_command(client, message):
         "• 📊 Statistics tracking\n"
         "• 💾 Supports all file types\n\n"
         "**Commands:**\n"
-        "/start - Show this message\n"
         "/stats - View upload statistics\n\n"
-        "Just send files or albums to get started!"
+        "Just forward the files to get started!"
     )
 
 @app.on_message(filters.command("stats") & filters.user(OWNER_ID))
@@ -513,7 +512,7 @@ async def handle_media(client, message: Message):
                             f"🔍 Detected: `{detected_series}`\n\n"
                             f"Choose upload mode:",
                             reply_markup=InlineKeyboardMarkup([
-                                [InlineKeyboardButton("📁 Standalone (each in own folder)", callback_data=f"std|{key}")],
+                                [InlineKeyboardButton("📁 Standalone", callback_data=f"std|{key}")],
                                 [InlineKeyboardButton(f"📂 Series: {detected_series}", callback_data=f"auto|{key}")],
                                 [InlineKeyboardButton("✏️ Custom Series Name", callback_data=f"custom|{key}")]
                             ])
@@ -589,9 +588,8 @@ async def handle_callback(client, query):
                 'key': key
             }
             await query.message.edit_text(
-                "✏️ **Enter Custom Series Name**\n\n"
-                "Reply with the series name you want to use.\n"
-                "Example: `My Awesome Series`"
+                "✏️ ` Enter Custom Series Name `\n\n"
+            
             )
         
         await query.answer()
