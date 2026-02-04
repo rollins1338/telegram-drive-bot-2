@@ -99,7 +99,7 @@ def upload_to_drive_logic(file_path, file_name, mime_type, series_name=None):
     try:
         current_parent_id = DRIVE_FOLDER_ID
         if series_name:
-            series_id = create_get_folder(service, series_name, DRIVE_FOLDER_ID)
+            series_id = create_or_get_folder(service, series_name, DRIVE_FOLDER_ID)
             if not series_id: return None, "Failed to create Series Folder"
             current_parent_id = series_id
 
@@ -204,7 +204,26 @@ def is_authorized(func):
 @app.on_message(filters.command("start"))
 @is_authorized
 async def start(client, message):
-    await message.reply_text("👋 **Ready!** Send a file.")
+    await message.reply_text(
+        "👋 **Bot is Online!**\n\n"
+        "Send me any file and I will upload it to your Google Drive.\n"
+        "Use /help to see available commands."
+    )
+
+@app.on_message(filters.command("help"))
+@is_authorized
+async def help_command(client, message):
+    await message.reply_text(
+        "📖 **Bot Help Menu**\n\n"
+        "**Commands:**\n"
+        "• /start - Restart the bot\n"
+        "• /stats - Check session statistics\n"
+        "• /help - Show this message\n\n"
+        "**How to Upload:**\n"
+        "1. Send a file to the bot.\n"
+        "2. Select **Standalone** for a single book folder.\n"
+        "3. Select **Add to Series** to group multiple books in a series folder."
+    )
 
 @app.on_message(filters.command("stats"))
 @is_authorized
