@@ -792,10 +792,10 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
 async def start_command(client, message):
     """Welcome message"""
     await message.reply_text(
-        "🤖 **Telegram to Google Drive Bot**\n\n"
-        "📤 Send me files or albums and I'll upload them to Google Drive!\n\n"
+        "🤖 **Hi, I'm RxUploader**\n\n"
+        "📤 Send me files and I'll upload them to Rx's Google Drive!\n\n"
         "**Commands:**\n"
-        "/start - Show this message\n"
+        "/start - Wake me up!\n"
         "/stats - View upload statistics\n"
         "/status - Detailed status of all operations\n"
         "/queue - View upload queue\n"
@@ -803,13 +803,13 @@ async def start_command(client, message):
         "/retry - View and retry failed uploads\n"
         "/clearfailed - Clear failed uploads history\n\n"
         "**Features:**\n"
-        "• Album support with auto-detection\n"
+        "• Multi support with auto-detection\n"
         "• Series organization (auto or custom)\n"
         "• Queue management\n"
         "• Real-time progress tracking\n"
         "• Auto-retry on errors (up to 3 attempts)\n"
         "• Cancel anytime\n\n"
-        "Just send files or albums to get started!"
+        "Send me the next Audiobook!"
     )
 
 @app.on_message(filters.command("stats") & filters.user(OWNER_ID))
@@ -1131,7 +1131,7 @@ async def handle_text(client, message: Message):
 
 # ==================== MAIN ====================
 if __name__ == "__main__":
-    logger.info("🤖 Starting Telegram to Google Drive Bot...")
+    logger.info("🤖 Starting RxUploader...")
     
     # Create downloads directory
     os.makedirs("downloads", exist_ok=True)
