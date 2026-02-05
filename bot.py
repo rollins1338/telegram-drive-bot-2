@@ -662,9 +662,9 @@ async def handle_media(client, message: Message):
             # 2. Standalone
             buttons.append([InlineKeyboardButton("📁 Standalone", callback_data=f"std|{key}")])
             # 3. Not an Audiobook
-            buttons.append([InlineKeyboardButton("🚫 Not an Audiobook", callback_data=f"root|{key}")])
-            # 4. Custom
             buttons.append([InlineKeyboardButton("✏️ Custom Series Name", callback_data=f"custom|{key}")])
+            # 4. Custom
+            buttons.append([InlineKeyboardButton("🚫 Not an Audiobook", callback_data=f"root|{key}")])
             
             txt = f"📄 **File Received**\n`{filename}`"
             if caption: txt += f"\n🏷 **Caption:** `{caption}`"
@@ -722,9 +722,8 @@ async def handle_callback(client, query):
                 'key': key
             }
             await query.message.edit_text(
-                "✏️ **Enter Custom Series Name**\n\n"
-                "Reply with the series name you want to use.\n"
-                "Example: `My Awesome Series`"
+                " ` Enter Custom Series Name `\n\n"
+                
             )
         
         await query.answer()
