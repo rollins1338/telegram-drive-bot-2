@@ -222,20 +222,104 @@ def clean_series_name(filename):
     
     return name or "Unknown Series"
 
+def upload_to_drive_with_progress(service, file_path, file_metadata, message_data, filename):
+    """
+    Upload file to Google Drive with progress tracking
+    message_data is a dict with {'chat_id': int, 'message_id': int, 'bot': Client}
+    """
+    try:
+        media = MediaFileUpload(
+            file_path,
+            resumable=True,
+            chunksize=5*1024*1024  # 5 MB chunks for better progress updates
+        )
+        
+        request = service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields='id, size, webViewLink'
+        )
+        
+        response = None
+        last_progress = 0
+        last_update = time.time()
+        file_size = os.path.getsize(file_path)
+        start_time = time.time()
+        last_uploaded = 0
+        
+        while response is None:
+            status, response = request.next_chunk()
+            
+            if status:
+                progress = int(status.progress() * 100)
+                current_bytes = int(status.progress() * file_size)
+                now = time.time()
+                
+                # Update every 2 seconds or on significant progress change
+                if (now - last_update) > 2 or progress - last_progress >= 5:
+                    # Calculate speed
+                    time_diff = now - last_update if (now - last_update) > 0 else 0.1
+                    bytes_diff = current_bytes - last_uploaded
+                    speed = bytes_diff / time_diff if time_diff > 0 else 0
+                    
+                    # Progress bar
+                    filled = int(progress // 10)
+                    bar = '■' * filled + '□' * (10 - filled)
+                    
+                    # ETA
+                    if speed > 0 and current_bytes < file_size:
+                        remaining = file_size - current_bytes
+                        eta_seconds = remaining / speed
+                        eta = str(datetime.timedelta(seconds=int(eta_seconds)))
+                    else:
+                        eta = "Calculating..." if current_bytes < file_size else "Done"
+                    
+                    # Update message (will be called from executor, but we store the data)
+                    message_data['last_progress'] = {
+                        'bar': bar,
+                        'progress': progress,
+                        'speed': speed,
+                        'current': current_bytes,
+                        'total': file_size,
+                        'eta': eta,
+                        'filename': filename
+                    }
+                    
+                    last_progress = progress
+                    last_update = now
+                    last_uploaded = current_bytes
+        
+        # Mark as complete
+        message_data['complete'] = True
+        return response
+    
+    except Exception as e:
+        logger.error(f"Upload error: {e}")
+        message_data['error'] = str(e)
+        raise
+
 # ==================== PROGRESS CALLBACK ====================
 async def progress_callback(current, total, message, start_time, filename):
-    """Show upload/download progress"""
+    """Show upload/download progress with accurate speed"""
     now = time.time()
     
-    # Update every 3 seconds or on completion
+    # Initialize tracking variables
     if not hasattr(message, 'last_update'):
         message.last_update = 0
+        message.last_current = 0
+        message.last_time = start_time
     
-    if (now - message.last_update) > 3 or current == total:
-        message.last_update = now
+    # Update every 2 seconds or on completion
+    if (now - message.last_update) > 2 or current == total:
+        # Calculate incremental speed (more accurate)
+        time_diff = now - message.last_time
+        bytes_diff = current - message.last_current
         
-        elapsed = now - start_time
-        speed = current / elapsed if elapsed > 0 else 0
+        if time_diff > 0:
+            speed = bytes_diff / time_diff  # Bytes per second
+        else:
+            speed = 0
+        
         percentage = (current / total) * 100
         
         # Progress bar
@@ -244,10 +328,11 @@ async def progress_callback(current, total, message, start_time, filename):
         
         # ETA calculation
         if speed > 0 and current < total:
-            eta_seconds = (total - current) / speed
+            remaining_bytes = total - current
+            eta_seconds = remaining_bytes / speed
             eta = str(datetime.timedelta(seconds=int(eta_seconds)))
         else:
-            eta = "Done"
+            eta = "Calculating..." if current < total else "Done"
         
         try:
             await message.edit_text(
@@ -261,6 +346,11 @@ async def progress_callback(current, total, message, start_time, filename):
         except Exception:
             # Ignore errors (likely flood wait or message not modified)
             pass
+        
+        # Update tracking variables
+        message.last_update = now
+        message.last_current = current
+        message.last_time = now
 
 # ==================== UPLOAD TASK ====================
 async def upload_task(client: Client, status_msg: Message, file_list: list, series_name: str = None):
@@ -353,34 +443,59 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
                 
                 upload_folder = file_folder
                 
-                # Upload to Drive
-                await status_msg.edit_text(
-                    f"☁️ **Uploading to Drive ({idx}/{len(file_list)})**\n"
-                    f"📄 `{filename}`\n"
-                    f"💾 Size: {file_size/1024/1024:.2f} MB"
-                )
-                
+                # Upload to Drive with progress
                 file_metadata = {
                     'name': filename,
                     'parents': [upload_folder]
                 }
                 
-                media = MediaFileUpload(
-                    download_path,
-                    resumable=True,
-                    chunksize=10*1024*1024  # 10 MB chunks
+                # Initial upload message
+                await status_msg.edit_text(
+                    f"☁️ **Uploading to Drive ({idx}/{len(file_list)})**\n"
+                    f"📄 `{filename}`\n"
+                    f"💾 Size: {file_size/1024/1024:.2f} MB\n\n"
+                    f"Starting upload..."
                 )
                 
-                # Upload with chunked upload for large files
+                # Shared data for progress tracking
+                progress_data = {'complete': False, 'error': None, 'last_progress': None}
+                
+                # Start upload in executor
                 loop = asyncio.get_running_loop()
-                upload_result = await loop.run_in_executor(
+                upload_future = loop.run_in_executor(
                     None,
-                    lambda: service.files().create(
-                        body=file_metadata,
-                        media_body=media,
-                        fields='id, size, webViewLink'
-                    ).execute()
+                    upload_to_drive_with_progress,
+                    service,
+                    download_path,
+                    file_metadata,
+                    progress_data,
+                    filename
                 )
+                
+                # Monitor progress while upload is running
+                while not progress_data.get('complete') and not progress_data.get('error'):
+                    if progress_data.get('last_progress'):
+                        p = progress_data['last_progress']
+                        try:
+                            await status_msg.edit_text(
+                                f"☁️ **Uploading to Drive ({idx}/{len(file_list)})**\n"
+                                f"📄 `{p['filename'][:40]}...`\n\n"
+                                f"[{p['bar']}] {p['progress']}%\n"
+                                f"⚡ Speed: {p['speed']/1024/1024:.2f} MB/s\n"
+                                f"💾 {p['current']/1024/1024:.1f} MB / {p['total']/1024/1024:.1f} MB\n"
+                                f"⏱️ ETA: {p['eta']}"
+                            )
+                        except:
+                            pass
+                    
+                    # Check every second
+                    await asyncio.sleep(1)
+                
+                # Wait for upload to complete
+                upload_result = await upload_future
+                
+                if progress_data.get('error'):
+                    raise Exception(progress_data['error'])
                 
                 # Update stats
                 uploaded_size = int(upload_result.get('size', file_size))
@@ -443,8 +558,9 @@ async def start_command(client, message):
         "• 📊 Statistics tracking\n"
         "• 💾 Supports all file types\n\n"
         "**Commands:**\n"
+        "/start - Show this message\n"
         "/stats - View upload statistics\n\n"
-        "Just forward the files to get started!"
+        "Just send files or albums to get started!"
     )
 
 @app.on_message(filters.command("stats") & filters.user(OWNER_ID))
@@ -512,7 +628,7 @@ async def handle_media(client, message: Message):
                             f"🔍 Detected: `{detected_series}`\n\n"
                             f"Choose upload mode:",
                             reply_markup=InlineKeyboardMarkup([
-                                [InlineKeyboardButton("📁 Standalone", callback_data=f"std|{key}")],
+                                [InlineKeyboardButton("📁 Standalone (each in own folder)", callback_data=f"std|{key}")],
                                 [InlineKeyboardButton(f"📂 Series: {detected_series}", callback_data=f"auto|{key}")],
                                 [InlineKeyboardButton("✏️ Custom Series Name", callback_data=f"custom|{key}")]
                             ])
@@ -588,8 +704,9 @@ async def handle_callback(client, query):
                 'key': key
             }
             await query.message.edit_text(
-                "✏️ ` Enter Custom Series Name `\n\n"
-            
+                "✏️ **Enter Custom Series Name**\n\n"
+                "Reply with the series name you want to use.\n"
+                "Example: `My Awesome Series`"
             )
         
         await query.answer()
