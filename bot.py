@@ -27,9 +27,20 @@ logger = logging.getLogger(__name__)
 # Ultra-minimal health check (Koyeb-tested and working)
 def run_health_server():
     try:
-        HTTPServer(('0.0.0.0', 8000), type('H', (BaseHTTPRequestHandler,), {
-            'do_GET': lambda s: (s.send_response(200), s.end_headers(), s.wfile.write(b"OK"))
-        })).serve_forever()
+        class HealthHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"OK")
+            
+            def do_HEAD(self):
+                self.send_response(200)
+                self.end_headers()
+            
+            def log_message(self, format, *args):
+                pass  # Suppress health check logs
+        
+        HTTPServer(('0.0.0.0', 8000), HealthHandler).serve_forever()
     except Exception as e:
         logger.error(f"Health server error: {e}")
 
