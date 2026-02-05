@@ -881,26 +881,6 @@ async def stats_command(client, message):
     
     await message.reply_text(stats_text)
 
-@app.on_callback_query(filters.user(OWNER_ID))
-async def handle_callback(client, callback_query):
-    """Handle button callbacks"""
-    data = callback_query.data
-    
-    if data.startswith("cancel_"):
-        task_id = data.replace("cancel_", "")
-        
-        if task_id in ACTIVE_TASKS:
-            ACTIVE_TASKS[task_id]['cancelled'] = True
-            logger.info(f"Cancelling task via button: {task_id}")
-            
-            await callback_query.answer("🛑 Cancellation requested...", show_alert=True)
-            await callback_query.message.edit_text(
-                f"🛑 **Cancellation Requested**\n\n"
-                f"Please wait for the task to stop..."
-            )
-        else:
-            await callback_query.answer("ℹ️ Task already completed", show_alert=True)
-
 @app.on_message(filters.command("cancel") & filters.user(OWNER_ID))
 async def cancel_command(client, message):
     """Cancel active upload/download tasks"""
@@ -1119,6 +1099,23 @@ async def handle_media(client, message: Message):
 async def handle_callback(client, query):
     """Handle button callbacks"""
     try:
+        # Check for cancel button
+        if query.data.startswith("cancel_"):
+            task_id = query.data.replace("cancel_", "")
+            
+            if task_id in ACTIVE_TASKS:
+                ACTIVE_TASKS[task_id]['cancelled'] = True
+                logger.info(f"Cancelling task via button: {task_id}")
+                
+                await query.answer("🛑 Cancellation requested...", show_alert=True)
+                await query.message.edit_text(
+                    f"🛑 **Cancellation Requested**\n\n"
+                    f"Please wait for the task to stop..."
+                )
+            else:
+                await query.answer("ℹ️ Task already completed", show_alert=True)
+            return
+        
         data_parts = query.data.split('|')
         mode = data_parts[0]
         key = data_parts[1] if len(data_parts) > 1 else None
