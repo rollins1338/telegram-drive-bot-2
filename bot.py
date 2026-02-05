@@ -239,6 +239,23 @@ def clean_series_name(filename):
     
     return name or "Unknown Series"
 
+def clean_filename(filename):
+    """
+    Clean up filename by replacing underscores with spaces
+    Preserves file extension
+    """
+    # Split filename and extension
+    name, ext = os.path.splitext(filename)
+    
+    # Replace underscores with spaces
+    name = name.replace('_', ' ')
+    
+    # Clean up multiple spaces
+    name = re.sub(r'\s+', ' ', name).strip()
+    
+    # Recombine with extension
+    return name + ext
+
 def format_size(bytes_size):
     """Convert bytes to human readable format"""
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
@@ -545,6 +562,9 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
             msg_id = file_info['msg_id']
             download_path = None
             
+            # Clean the filename (replace underscores with spaces)
+            clean_name = clean_filename(filename)
+            
             # Update task progress
             ACTIVE_TASKS[task_id]['current_file'] = filename
             ACTIVE_TASKS[task_id]['progress'] = int((idx - 1) / len(file_list) * 100)
@@ -630,7 +650,7 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
                     
                     # Upload to Drive with progress
                     file_metadata = {
-                        'name': filename,
+                        'name': clean_name,  # Use cleaned filename
                         'parents': [upload_folder]
                     }
                     
