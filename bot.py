@@ -464,13 +464,18 @@ async def progress_callback(current, total, message, start_time, filename, task_
             eta = "Calculating..." if current < total else "Done"
         
         try:
+            cancel_button = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🛑 Cancel Upload", callback_data=f"cancel_{task_id}")]
+            ])
+            
             await message.edit_text(
                 f"📊 **Progress**\n"
                 f"📄 `{filename[:40]}...`\n\n"
                 f"[{bar}] {percentage:.1f}%\n"
                 f"⚡ Speed: {speed/1024/1024:.2f} MB/s\n"
                 f"💾 {current/1024/1024:.1f} MB / {total/1024/1024:.1f} MB\n"
-                f"⏱️ ETA: {eta}"
+                f"⏱️ ETA: {eta}",
+                reply_markup=cancel_button
             )
         except Exception:
             pass
@@ -578,11 +583,18 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
                 try:
                     # Update status with retry info
                     retry_text = f" (Retry {retry_count}/{MAX_RETRIES})" if retry_count > 0 else ""
+                    
+                    # Create cancel button
+                    cancel_button = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🛑 Cancel Upload", callback_data=f"cancel_{task_id}")]
+                    ])
+                    
                     await status_msg.edit_text(
                         f"📥 **Downloading ({idx}/{len(file_list)}){retry_text}**\n"
                         f"📄 `{filename[:50]}...`\n"
                         f"✅ {successful_uploads} | ❌ {len(failed_uploads)}\n"
-                        f"📊 Progress: {int((idx-1)/len(file_list)*100)}%"
+                        f"📊 Progress: {int((idx-1)/len(file_list)*100)}%",
+                        reply_markup=cancel_button
                     )
                     
                     # Download file
@@ -655,13 +667,18 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
                     }
                     
                     # Initial upload message
+                    cancel_button = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🛑 Cancel Upload", callback_data=f"cancel_{task_id}")]
+                    ])
+                    
                     await status_msg.edit_text(
                         f"☁️ **Uploading to Drive ({idx}/{len(file_list)}){retry_text}**\n"
                         f"📄 `{filename[:50]}...`\n"
                         f"💾 Size: {file_size/1024/1024:.2f} MB\n"
                         f"✅ {successful_uploads} | ❌ {len(failed_uploads)}\n"
                         f"📊 Progress: {int((idx-1)/len(file_list)*100)}%\n\n"
-                        f"Starting upload..."
+                        f"Starting upload...",
+                        reply_markup=cancel_button
                     )
                     
                     # Shared data for progress tracking
@@ -863,6 +880,26 @@ async def stats_command(client, message):
         stats_text += f"\n\n🔄 **Active Tasks:** {len(ACTIVE_TASKS)}"
     
     await message.reply_text(stats_text)
+
+@app.on_callback_query(filters.user(OWNER_ID))
+async def handle_callback(client, callback_query):
+    """Handle button callbacks"""
+    data = callback_query.data
+    
+    if data.startswith("cancel_"):
+        task_id = data.replace("cancel_", "")
+        
+        if task_id in ACTIVE_TASKS:
+            ACTIVE_TASKS[task_id]['cancelled'] = True
+            logger.info(f"Cancelling task via button: {task_id}")
+            
+            await callback_query.answer("🛑 Cancellation requested...", show_alert=True)
+            await callback_query.message.edit_text(
+                f"🛑 **Cancellation Requested**\n\n"
+                f"Please wait for the task to stop..."
+            )
+        else:
+            await callback_query.answer("ℹ️ Task already completed", show_alert=True)
 
 @app.on_message(filters.command("cancel") & filters.user(OWNER_ID))
 async def cancel_command(client, message):
