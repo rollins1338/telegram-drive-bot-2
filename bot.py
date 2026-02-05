@@ -1099,7 +1099,7 @@ async def handle_callback(client, query):
                 'key': key
             }
             await query.message.edit_text(
-                "✏️ **Enter Custom Series Name**\n\n"
+                " ` Enter Custom Series Name `\n\n"
                 "Reply with the series name you want to use."
             )
         
