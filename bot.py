@@ -652,7 +652,8 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
                         upload_folder = parent_folder
                     else:
                         # Standard behavior: Create individual folder for the file
-                        folder_name = os.path.splitext(filename)[0]
+                        # Use cleaned name without extension for folder
+                        folder_name = os.path.splitext(clean_name)[0]
                         file_folder = get_or_create_folder(service, folder_name, parent_folder)
                         
                         if not file_folder:
@@ -1058,6 +1059,8 @@ async def handle_media(client, message: Message):
                         buttons.append([InlineKeyboardButton("🚫 Not an Audiobook", callback_data=f"root|{key}")])
                         # 4. Custom
                         buttons.append([InlineKeyboardButton("✏️ Custom Series Name", callback_data=f"custom|{key}")])
+                        # 5. Cancel
+                        buttons.append([InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_selection|{key}")])
 
                         txt = f"📦 **Album Detected**\n📚 Files: {len(file_list)}"
                         if detected_caption: txt += f"\n🏷 **Caption:** `{detected_caption}`"
@@ -1082,10 +1085,12 @@ async def handle_media(client, message: Message):
             
             # 2. Standalone
             buttons.append([InlineKeyboardButton("📁 Standalone", callback_data=f"std|{key}")])
-            # 3. Not an Audiobook
+            # 3. Custom Series Name
             buttons.append([InlineKeyboardButton("✏️ Custom Series Name", callback_data=f"custom|{key}")])
-            # 4. Custom
+            # 4. Not an Audiobook
             buttons.append([InlineKeyboardButton("🚫 Not an Audiobook", callback_data=f"root|{key}")])
+            # 5. Cancel
+            buttons.append([InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_selection|{key}")])
             
             txt = f"📄 **File Received**\n`{filename}`"
             if caption: txt += f"\n🏷 **Caption:** `{caption}`"
@@ -1099,7 +1104,27 @@ async def handle_media(client, message: Message):
 async def handle_callback(client, query):
     """Handle button callbacks"""
     try:
-        # Check for cancel button
+        # Check for cancel selection button (before upload starts)
+        if query.data.startswith("cancel_selection|"):
+            key = query.data.replace("cancel_selection|", "")
+            
+            # Remove from temp files
+            if key in TEMP_FILES:
+                file_count = len(TEMP_FILES[key])
+                del TEMP_FILES[key]
+                logger.info(f"User cancelled selection for key: {key}")
+                
+                await query.answer("✅ Cancelled", show_alert=False)
+                await query.message.edit_text(
+                    f"❌ **Upload Cancelled**\n\n"
+                    f"{file_count} file(s) discarded.\n"
+                    f"Send new files to upload again."
+                )
+            else:
+                await query.answer("ℹ️ Already processed", show_alert=True)
+            return
+        
+        # Check for cancel button (during upload)
         if query.data.startswith("cancel_"):
             task_id = query.data.replace("cancel_", "")
             
