@@ -579,7 +579,6 @@ async def download_from_drive_task(client, status_msg, file_ids, service):
                 ACTIVE_TASKS[task_id]['progress'] = int((idx - 1) / total_files * 100)
                 
                 # Update status
- if status:
                         progress = int(status.progress() * 100)
                         try:
                             await status_msg.edit_text(
