@@ -24,6 +24,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==================== HEALTH CHECK SERVER ====================
+# Ultra-minimal health check (Koyeb-tested and working)
 def run_health_server():
     try:
         class HealthHandler(BaseHTTPRequestHandler):
@@ -79,21 +80,21 @@ app = Client(
 ALBUMS = {}
 TEMP_FILES = {}
 ACTIVE_SERIES = {}
-ACTIVE_TASKS = {}
+ACTIVE_TASKS = {}  # Track active upload tasks for cancellation
 
 # Queue Management
-UPLOAD_QUEUE = {}
+UPLOAD_QUEUE = {}  # Format: {queue_id: {'files': [], 'series_name': str, 'flat_upload': bool, 'status': str, 'created_at': float}}
 QUEUE_COUNTER = 0
 
 # Error Recovery
-FAILED_UPLOADS = {}
+FAILED_UPLOADS = {}  # Format: {task_id: {'files': [], 'errors': [], 'timestamp': float}}
 MAX_RETRIES = 3
-RETRY_DELAY = 5
+RETRY_DELAY = 5  # seconds
 
 # File Browser State
-BROWSER_SESSIONS = {}
-DOWNLOAD_QUEUE = {}
-FAVORITES = {}
+BROWSER_SESSIONS = {}  # Format: {user_id: {'current_folder': str, 'path': [], 'selected_files': [], 'page': int}}
+DOWNLOAD_QUEUE = {}  # Format: {task_id: {'files': [], 'status': str, 'progress': int}}
+FAVORITES = {}  # Format: {user_id: [{'name': str, 'id': str}]}
 
 # Pagination settings
 ITEMS_PER_PAGE = 8
@@ -184,199 +185,296 @@ def sync_stats(service, save=False):
         logger.error(f"Error syncing stats: {e}")
 
 def get_or_create_folder(service, folder_name, parent_id):
-    """Find existing folder or create new one - FIXED VERSION"""
+    """Find existing folder or create new one"""
     try:
         # Sanitize folder name
         clean_name = folder_name.replace('"', '\\"')
         
-        # FIXED: More comprehensive search that includes supportsAllDrives
-        # This will find folders even if they were created outside the bot
+        # Search for existing folder
         query = f'name="{clean_name}" and "{parent_id}" in parents and mimeType="application/vnd.google-apps.folder" and trashed=false'
-        
         results = service.files().list(
             q=query,
             fields="files(id, name)",
-            spaces='drive',
-            supportsAllDrives=True,  # ADDED: Support shared drives
-            includeItemsFromAllDrives=True  # ADDED: Include items from all drives
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
         ).execute()
         
         folders = results.get('files', [])
         
         if folders:
-            logger.info(f"📁 Found existing folder: {folder_name}")
             return folders[0]['id']
         
-        # Create new folder if not found
-        folder_metadata = {
+        # Create new folder
+        file_metadata = {
             'name': folder_name,
             'mimeType': 'application/vnd.google-apps.folder',
             'parents': [parent_id]
         }
         
         folder = service.files().create(
-            body=folder_metadata,
+            body=file_metadata,
             fields='id',
-            supportsAllDrives=True  # ADDED
+            supportsAllDrives=True
         ).execute()
         
         logger.info(f"📁 Created new folder: {folder_name}")
-        return folder['id']
-    
-    except Exception as e:
-        logger.error(f"Error in get_or_create_folder: {e}")
-        raise
-
-def list_drive_files(service, folder_id=None, search_query=None):
-    """List files and folders - FIXED VERSION"""
-    try:
-        if folder_id is None:
-            folder_id = DRIVE_FOLDER_ID
-        
-        folders = []
-        files = []
-        
-        # FIXED: Build query with proper Drive API parameters
-        if search_query:
-            # Search across ALL files in the main folder and subfolders
-            query = f"name contains '{search_query}' and '{DRIVE_FOLDER_ID}' in parents and trashed=false"
-        else:
-            # List direct children of specified folder
-            query = f"'{folder_id}' in parents and trashed=false"
-        
-        # FIXED: Added pagination and proper Drive API parameters
-        page_token = None
-        while True:
-            results = service.files().list(
-                q=query,
-                fields="nextPageToken, files(id, name, mimeType, size, createdTime, modifiedTime, webViewLink)",
-                pageSize=100,  # Increased from default
-                spaces='drive',
-                supportsAllDrives=True,  # CRITICAL FIX
-                includeItemsFromAllDrives=True,  # CRITICAL FIX
-                pageToken=page_token,
-                orderBy='folder,name'  # Folders first, then alphabetical
-            ).execute()
-            
-            items = results.get('files', [])
-            
-            for item in items:
-                if item['mimeType'] == 'application/vnd.google-apps.folder':
-                    folders.append(item)
-                else:
-                    files.append(item)
-            
-            page_token = results.get('nextPageToken')
-            if not page_token:
-                break
-        
-        logger.info(f"📂 Listed {len(folders)} folders and {len(files)} files from folder {folder_id}")
-        return folders, files, folder_id
+        return folder.get('id')
     
     except HttpError as e:
-        logger.error(f"HTTP Error listing files: {e}")
-        if e.resp.status == 403:
-            logger.error("Permission denied - check if service account has access to folder")
-        return [], [], folder_id
+        logger.error(f"HTTP error creating folder: {e}")
+        return None
     except Exception as e:
-        logger.error(f"Error listing files: {e}")
-        return [], [], folder_id
+        logger.error(f"Error creating folder: {e}")
+        return None
 
-def upload_to_drive(service, file_path, filename, parent_id):
-    """Upload a file to Google Drive"""
-    try:
-        file_metadata = {
-            'name': filename,
-            'parents': [parent_id]
+def clean_series_name(filename):
+    """
+    Extract clean series name from filename
+    Removes quality tags, group names, episode info, etc.
+    """
+    # Remove file extension
+    name = os.path.splitext(filename)[0]
+    
+    # Remove group tags [Group] or (Group)
+    name = re.sub(r'[\[\(][^\]\)]*[\]\)]', '', name)
+    
+    # Remove quality indicators
+    name = re.sub(r'\b(1080p|720p|480p|2160p|4K|UHD|HDR|BluRay|BRRip|WEBRip|WEBDL|WEB-DL|DVDRip|HDTV|x264|x265|HEVC|AAC|AC3|DTS|DD5\.1|10bit|8bit)\b', '', name, flags=re.IGNORECASE)
+    
+    # Remove episode indicators (S01E01, 1x01, etc)
+    name = re.sub(r'\b(S\d+E\d+|s\d+e\d+|\d+x\d+|Episode?\s*\d+|Ep?\s*\d+|E\d+|Ch\d+|Chapter\s*\d+)\b', '', name, flags=re.IGNORECASE)
+    
+    # Remove separators and clean up
+    name = re.sub(r'[._-]+', ' ', name)
+    name = re.sub(r'\s+', ' ', name).strip()
+    
+    return name or "Unknown Series"
+
+def clean_filename(filename):
+    """
+    Clean up filename by replacing underscores with spaces
+    Preserves file extension
+    """
+    # Split filename and extension
+    name, ext = os.path.splitext(filename)
+    
+    # Replace underscores with spaces
+    name = name.replace('_', ' ')
+    
+    # Clean up multiple spaces
+    name = re.sub(r'\s+', ' ', name).strip()
+    
+    # Recombine with extension
+    return name + ext
+
+def format_size(bytes_size):
+    """Convert bytes to human readable format"""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if bytes_size < 1024.0:
+            return f"{bytes_size:.2f} {unit}"
+        bytes_size /= 1024.0
+    return f"{bytes_size:.2f} PB"
+
+def format_time(seconds):
+    """Convert seconds to human readable format"""
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    elif seconds < 3600:
+        return f"{int(seconds/60)}m {int(seconds%60)}s"
+    else:
+        hours = int(seconds/3600)
+        mins = int((seconds%3600)/60)
+        return f"{hours}h {mins}m"
+
+def add_to_queue(file_list, series_name=None, flat_upload=False):
+    """Add upload task to queue"""
+    global QUEUE_COUNTER
+    QUEUE_COUNTER += 1
+    queue_id = f"queue_{QUEUE_COUNTER}"
+    
+    UPLOAD_QUEUE[queue_id] = {
+        'files': file_list,
+        'series_name': series_name,
+        'flat_upload': flat_upload,
+        'status': 'pending',
+        'created_at': time.time(),
+        'priority': QUEUE_COUNTER
+    }
+    
+    logger.info(f"Added to queue: {queue_id} with {len(file_list)} files")
+    return queue_id
+
+def get_queue_status():
+    """Get formatted queue status"""
+    if not UPLOAD_QUEUE:
+        return "📭 Queue is empty"
+    
+    status_text = "📋 **Upload Queue**\n\n"
+    
+    for queue_id, data in sorted(UPLOAD_QUEUE.items(), key=lambda x: x[1]['priority']):
+        status = data['status']
+        files_count = len(data['files'])
+        series = data.get('series_name', 'Standalone')
+        age = time.time() - data['created_at']
+        
+        status_emoji = {
+            'pending': '⏳',
+            'uploading': '🔄',
+            'paused': '⏸️',
+            'completed': '✅',
+            'failed': '❌'
+        }.get(status, '❓')
+        
+        status_text += f"{status_emoji} `{queue_id}`\n"
+        status_text += f"  Files: {files_count} | Series: {series}\n"
+        status_text += f"  Age: {format_time(age)} | Status: {status}\n\n"
+    
+    return status_text
+
+def remove_from_queue(queue_id):
+    """Remove item from queue"""
+    if queue_id in UPLOAD_QUEUE:
+        del UPLOAD_QUEUE[queue_id]
+        logger.info(f"Removed from queue: {queue_id}")
+        return True
+    return False
+
+def record_failed_upload(task_id, filename, error):
+    """Record failed upload for retry"""
+    if task_id not in FAILED_UPLOADS:
+        FAILED_UPLOADS[task_id] = {
+            'files': [],
+            'errors': [],
+            'timestamp': time.time()
         }
+    
+    FAILED_UPLOADS[task_id]['files'].append(filename)
+    FAILED_UPLOADS[task_id]['errors'].append(f"{filename}: {str(error)[:100]}")
+    logger.error(f"Recorded failed upload: {filename} in task {task_id}")
+
+# ==================== FILE BROWSER FUNCTIONS ====================
+def list_drive_files(service, folder_id, page_token=None):
+    """List files and folders in a Google Drive folder"""
+    try:
+        query = f"'{folder_id}' in parents and trashed=false"
         
-        media = MediaFileUpload(
-            file_path,
-            resumable=True,
-            chunksize=5*1024*1024  # 5MB chunks
-        )
+        results = service.files().list(
+            q=query,
+            pageSize=100,
+            pageToken=page_token,
+            fields="nextPageToken, files(id, name, mimeType, size, modifiedTime, parents)",
+            orderBy="folder,name",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
+        ).execute()
         
-        file = service.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields='id, size, webViewLink',
-            supportsAllDrives=True  # ADDED
+        items = results.get('files', [])
+        next_page_token = results.get('nextPageToken')
+        
+        # Separate folders and files
+        folders = [item for item in items if item['mimeType'] == 'application/vnd.google-apps.folder']
+        files = [item for item in items if item['mimeType'] != 'application/vnd.google-apps.folder']
+        
+        return folders, files, next_page_token
+    
+    except Exception as e:
+        logger.error(f"Error listing Drive files: {e}")
+        return [], [], None
+
+def get_folder_info(service, folder_id):
+    """Get information about a folder"""
+    try:
+        if folder_id == DRIVE_FOLDER_ID:
+            return {'id': DRIVE_FOLDER_ID, 'name': 'My Drive', 'parents': []}
+        
+        file = service.files().get(
+            fileId=folder_id,
+            fields="id, name, parents",
+            supportsAllDrives=True
         ).execute()
         
         return file
     
     except Exception as e:
-        logger.error(f"Error uploading {filename}: {e}")
-        raise
+        logger.error(f"Error getting folder info: {e}")
+        return None
 
-def download_from_drive(service, file_id, destination_path):
-    """Download a file from Google Drive"""
+def search_drive_files(service, query, folder_id=None):
+    """Search for files in Google Drive"""
     try:
-        request = service.files().get_media(
-            fileId=file_id,
-            supportsAllDrives=True  # ADDED
-        )
+        search_query = f"name contains '{query}' and trashed=false"
         
-        fh = io.FileIO(destination_path, 'wb')
-        downloader = MediaIoBaseDownload(fh, request, chunksize=5*1024*1024)
-        
-        done = False
-        while not done:
-            status, done = downloader.next_chunk()
-            if status:
-                progress = int(status.progress() * 100)
-                logger.debug(f"Download {progress}% complete")
-        
-        fh.close()
-        return True
-    
-    except Exception as e:
-        logger.error(f"Error downloading file: {e}")
-        return False
-
-def search_drive(service, query_text, folder_id=None):
-    """Search for files in Drive - FIXED VERSION"""
-    try:
-        # Escape special characters
-        clean_query = query_text.replace("'", "\\'").replace('"', '\\"')
-        
-        # FIXED: Search in all subfolders
         if folder_id:
-            query = f"name contains '{clean_query}' and '{folder_id}' in parents and trashed=false"
-        else:
-            # Search everything under main folder
-            query = f"name contains '{clean_query}' and '{DRIVE_FOLDER_ID}' in parents and trashed=false"
+            search_query += f" and '{folder_id}' in parents"
         
         results = service.files().list(
-            q=query,
-            fields="files(id, name, mimeType, size, modifiedTime, webViewLink, parents)",
+            q=search_query,
             pageSize=50,
-            spaces='drive',
-            supportsAllDrives=True,  # CRITICAL FIX
-            includeItemsFromAllDrives=True,  # CRITICAL FIX
-            orderBy='modifiedTime desc'
+            fields="files(id, name, mimeType, size, modifiedTime, parents)",
+            orderBy="folder,name",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
         ).execute()
         
-        return results.get('files', [])
+        items = results.get('files', [])
+        
+        # Separate folders and files
+        folders = [item for item in items if item['mimeType'] == 'application/vnd.google-apps.folder']
+        files = [item for item in items if item['mimeType'] != 'application/vnd.google-apps.folder']
+        
+        return folders, files
     
     except Exception as e:
         logger.error(f"Error searching Drive: {e}")
-        return []
+        return [], []
 
-# ==================== BROWSER HELPERS ====================
-def get_breadcrumb(session):
-    """Generate breadcrumb navigation"""
-    if not session['path']:
-        return "📁 Root"
+def get_browser_session(user_id):
+    """Get or create browser session for user"""
+    if user_id not in BROWSER_SESSIONS:
+        BROWSER_SESSIONS[user_id] = {
+            'current_folder': DRIVE_FOLDER_ID,
+            'path': [{'name': 'My Drive', 'id': DRIVE_FOLDER_ID}],
+            'selected_files': [],
+            'page': 0,
+            'view_mode': 'browse'  # browse, search, favorites
+        }
+    return BROWSER_SESSIONS[user_id]
+
+def format_file_item(file_info, selected=False):
+    """Format file information for display"""
+    name = file_info['name']
+    size = format_size(int(file_info.get('size', 0))) if 'size' in file_info else 'N/A'
     
-    crumbs = ["Root"] + [p['name'] for p in session['path']]
-    return " > ".join(crumbs)
+    # Get file type emoji
+    mime = file_info.get('mimeType', '')
+    if 'folder' in mime:
+        emoji = '📁'
+    elif 'video' in mime:
+        emoji = '🎬'
+    elif 'audio' in mime:
+        emoji = '🎵'
+    elif 'image' in mime:
+        emoji = '🖼️'
+    elif 'pdf' in mime:
+        emoji = '📄'
+    elif 'document' in mime or 'text' in mime:
+        emoji = '📝'
+    else:
+        emoji = '📎'
+    
+    checkbox = '✅' if selected else '☑️'
+    
+    return f"{emoji} {name[:35]}..." if len(name) > 35 else f"{emoji} {name}", size, checkbox
 
 def build_browser_keyboard(user_id, folders, files, total_items):
-    """Build file browser keyboard with pagination"""
-    session = BROWSER_SESSIONS.get(user_id, {'page': 0})
-    page = session.get('page', 0)
+    """Build inline keyboard for file browser"""
+    session = get_browser_session(user_id)
+    page = session['page']
+    selected = session['selected_files']
     
+    keyboard = []
+    
+    # Calculate pagination
     start_idx = page * ITEMS_PER_PAGE
     end_idx = start_idx + ITEMS_PER_PAGE
     
@@ -384,564 +482,1299 @@ def build_browser_keyboard(user_id, folders, files, total_items):
     all_items = folders + files
     page_items = all_items[start_idx:end_idx]
     
-    keyboard = []
-    
     # Add items
     for item in page_items:
         is_folder = item['mimeType'] == 'application/vnd.google-apps.folder'
-        icon = "📁" if is_folder else "📄"
-        name = item['name'][:30]  # Truncate long names
+        is_selected = item['id'] in selected
         
-        callback_data = f"folder|{item['id']}" if is_folder else f"file|{item['id']}"
-        keyboard.append([InlineKeyboardButton(f"{icon} {name}", callback_data=callback_data)])
+        name, size, checkbox = format_file_item(item, is_selected)
+        
+        if is_folder:
+            # Folder - click to open
+            keyboard.append([InlineKeyboardButton(
+                f"{name} ({size})",
+                callback_data=f"browser_open|{item['id']}"
+            )])
+        else:
+            # File - show select button and info
+            keyboard.append([
+                InlineKeyboardButton(checkbox, callback_data=f"browser_select|{item['id']}"),
+                InlineKeyboardButton(f"{name} ({size})", callback_data=f"browser_info|{item['id']}")
+            ])
     
-    # Navigation row
-    nav_row = []
-    
-    # Back button
-    if session.get('path'):
-        nav_row.append(InlineKeyboardButton("⬅️ Back", callback_data="browser_back"))
+    # Navigation buttons
+    nav_buttons = []
     
     # Pagination
-    total_pages = (total_items - 1) // ITEMS_PER_PAGE + 1 if total_items > 0 else 1
-    current_page = page + 1
-    
     if page > 0:
-        nav_row.append(InlineKeyboardButton("◀️ Prev", callback_data="browser_prev"))
-    
-    if total_pages > 1:
-        nav_row.append(InlineKeyboardButton(f"📄 {current_page}/{total_pages}", callback_data="browser_noop"))
+        nav_buttons.append(InlineKeyboardButton("◀️ Prev", callback_data="browser_prev"))
     
     if end_idx < total_items:
-        nav_row.append(InlineKeyboardButton("Next ▶️", callback_data="browser_next"))
+        nav_buttons.append(InlineKeyboardButton("Next ▶️", callback_data="browser_next"))
     
-    if nav_row:
-        keyboard.append(nav_row)
+    if nav_buttons:
+        keyboard.append(nav_buttons)
     
-    # Action row
-    action_row = [
-        InlineKeyboardButton("🔄 Refresh", callback_data="browser_refresh"),
+    # Action buttons
+    action_row = []
+    
+    if len(session['path']) > 1:
+        action_row.append(InlineKeyboardButton("⬅️ Back", callback_data="browser_back"))
+    
+    action_row.append(InlineKeyboardButton("🏠 Home", callback_data="browser_home"))
+    
+    if action_row:
+        keyboard.append(action_row)
+    
+    # Selection actions
+    if selected:
+        keyboard.append([
+            InlineKeyboardButton(f"⬇️ Download ({len(selected)})", callback_data="browser_download"),
+            InlineKeyboardButton("❌ Clear", callback_data="browser_clear")
+        ])
+    
+    # Utility buttons
+    keyboard.append([
         InlineKeyboardButton("🔍 Search", callback_data="browser_search"),
-        InlineKeyboardButton("⭐ Favs", callback_data="browser_favorites")
-    ]
-    keyboard.append(action_row)
-    
-    # Close button
-    keyboard.append([InlineKeyboardButton("❌ Close", callback_data="browser_close")])
+        InlineKeyboardButton("⭐ Favorites", callback_data="browser_favorites"),
+        InlineKeyboardButton("🔄 Refresh", callback_data="browser_refresh")
+    ])
     
     return InlineKeyboardMarkup(keyboard)
 
-# ==================== QUEUE MANAGEMENT ====================
-def add_to_queue(file_list, series_name=None, flat_upload=False):
-    """Add upload task to queue"""
-    global QUEUE_COUNTER
-    QUEUE_COUNTER += 1
-    queue_id = f"Q{QUEUE_COUNTER:04d}"
-    
-    UPLOAD_QUEUE[queue_id] = {
-        'files': file_list,
-        'series_name': series_name,
-        'flat_upload': flat_upload,
-        'status': 'queued',
-        'created_at': time.time(),
+def get_breadcrumb(session):
+    """Get breadcrumb navigation path"""
+    path_parts = [p['name'] for p in session['path']]
+    return " > ".join(path_parts)
+
+async def download_from_drive_task(client, status_msg, file_ids, service):
+    """Download files from Google Drive and send to Telegram"""
+    task_id = f"download_{status_msg.chat.id}_{status_msg.id}"
+    ACTIVE_TASKS[task_id] = {
+        'cancelled': False,
+        'files_list': file_ids,
+        'current_file': None,
         'progress': 0,
-        'total': len(file_list)
+        'status': 'initializing'
     }
     
-    logger.info(f"📋 Added to queue: {queue_id} ({len(file_list)} files)")
-    return queue_id
-
-def get_queue_status():
-    """Get formatted queue status"""
-    if not UPLOAD_QUEUE:
-        return "📋 Queue is empty"
-    
-    status = "📋 **Upload Queue**\n\n"
-    for queue_id, data in UPLOAD_QUEUE.items():
-        progress = data.get('progress', 0)
-        total = data.get('total', 0)
-        state = data.get('status', 'unknown')
-        name = data.get('series_name', 'N/A')
-        
-        status += f"`{queue_id}` - {name}\n"
-        status += f"└ Status: {state} ({progress}/{total})\n\n"
-    
-    return status
-
-# ==================== UPLOAD TASK ====================
-async def upload_task(client, status_msg, file_list, series_name=None, flat_upload=False, queue_id=None):
-    """Main upload task with progress tracking"""
-    service = get_drive_service()
-    if not service:
-        await status_msg.edit_text("❌ Failed to connect to Google Drive")
-        return
-    
-    # Create task ID for cancellation
-    task_id = f"upload_{int(time.time())}"
-    ACTIVE_TASKS[task_id] = {'cancelled': False}
+    successful = 0
+    failed = 0
+    total_files = len(file_ids)
     
     try:
-        # Update queue status
-        if queue_id and queue_id in UPLOAD_QUEUE:
-            UPLOAD_QUEUE[queue_id]['status'] = 'uploading'
-        
-        # Determine upload strategy
-        if flat_upload:
-            # Upload directly to root
-            parent_folder_id = DRIVE_FOLDER_ID
-        elif series_name:
-            # Create series folder
-            parent_folder_id = get_or_create_folder(service, series_name, DRIVE_FOLDER_ID)
-        else:
-            # Each file in its own folder
-            parent_folder_id = None
-        
-        total_files = len(file_list)
-        uploaded = 0
-        failed = []
-        global TOTAL_FILES, TOTAL_BYTES
-        
-        for idx, file_info in enumerate(file_list, 1):
+        for idx, file_id in enumerate(file_ids, 1):
             # Check for cancellation
-            if ACTIVE_TASKS[task_id].get('cancelled'):
-                await status_msg.edit_text(f"🛑 **Upload Cancelled**\n\n{uploaded}/{total_files} files uploaded")
-                break
+            if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
+                await status_msg.edit_text(
+                    f"🛑 **Download Cancelled**\n\n"
+                    f"✅ Downloaded: {successful}/{total_files}\n"
+                    f"❌ Failed: {failed}"
+                )
+                return
             
             try:
-                msg = await client.get_messages(file_info['chat_id'], file_info['message_id'])
+                # Get file metadata
+                file_metadata = service.files().get(
+                    fileId=file_id,
+                    fields="id, name, mimeType, size",
+                    supportsAllDrives=True
+                ).execute()
                 
-                # Update progress
+                filename = file_metadata['name']
+                file_size = int(file_metadata.get('size', 0))
+                
+                ACTIVE_TASKS[task_id]['current_file'] = filename
+                ACTIVE_TASKS[task_id]['progress'] = int((idx - 1) / total_files * 100)
+                
+                # Update status
                 await status_msg.edit_text(
-                    f"📤 **Uploading** ({idx}/{total_files})\n"
-                    f"📄 {file_info['name']}\n"
-                    f"📊 {format_size(file_info['size'])}"
+                    f"📥 **Downloading from Drive ({idx}/{total_files})**\n"
+                    f"📄 `{filename[:50]}...`\n"
+                    f"💾 Size: {format_size(file_size)}\n"
+                    f"✅ {successful} | ❌ {failed}"
                 )
                 
-                # Download from Telegram
-                local_path = await msg.download(file_name=f"downloads/{file_info['name']}")
+                # Download file from Drive
+                request = service.files().get_media(
+                    fileId=file_id,
+                    supportsAllDrives=True
+                )
+                download_path = f"downloads/{filename}"
                 
-                # Determine parent folder
-                if not flat_upload and not series_name:
-                    # Create individual folder for this file
-                    folder_name = os.path.splitext(file_info['name'])[0]
-                    upload_parent = get_or_create_folder(service, folder_name, DRIVE_FOLDER_ID)
+                os.makedirs("downloads", exist_ok=True)
+                
+                fh = io.FileIO(download_path, 'wb')
+                downloader = MediaIoBaseDownload(fh, request)
+                
+                done = False
+                while not done:
+                    # Check for cancellation
+                    if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
+                        fh.close()
+                        if os.path.exists(download_path):
+                            os.remove(download_path)
+                        await status_msg.edit_text(
+                            f"🛑 **Download Cancelled**\n\n"
+                            f"✅ Downloaded: {successful}/{total_files}\n"
+                            f"❌ Failed: {failed}"
+                        )
+                        return
+                    
+                    status, done = downloader.next_chunk()
+                    if status:
+                        progress = int(status.progress() * 100)
+                        await status_msg.edit_text(
+                            f"📥 **Downloading from Drive ({idx}/{total_files})**\n"
+                            f"📄 `{filename[:50]}...`\n"
+                            f"💾 Size: {format_size(file_size)}\n"
+                            f"📊 Progress: {progress}%\n"
+                            f"✅ {successful} | ❌ {failed}"
+                        )
+                
+                fh.close()
+                
+                # Send to Telegram
+                await status_msg.edit_text(
+                    f"📤 **Sending to Telegram ({idx}/{total_files})**\n"
+                    f"📄 `{filename[:50]}...`\n"
+                    f"💾 Size: {format_size(file_size)}\n"
+                    f"✅ {successful} | ❌ {failed}"
+                )
+                
+                # Determine mime type and send appropriate message
+                mime_type = file_metadata.get('mimeType', '')
+                
+                if 'video' in mime_type:
+                    await client.send_video(
+                        status_msg.chat.id,
+                        download_path,
+                        caption=filename
+                    )
+                elif 'audio' in mime_type:
+                    await client.send_audio(
+                        status_msg.chat.id,
+                        download_path,
+                        caption=filename
+                    )
+                elif 'image' in mime_type:
+                    await client.send_photo(
+                        status_msg.chat.id,
+                        download_path,
+                        caption=filename
+                    )
                 else:
-                    upload_parent = parent_folder_id
+                    await client.send_document(
+                        status_msg.chat.id,
+                        download_path,
+                        caption=filename
+                    )
                 
-                # Upload to Drive
-                result = upload_to_drive(service, local_path, file_info['name'], upload_parent)
+                # Clean up
+                if os.path.exists(download_path):
+                    os.remove(download_path)
                 
-                # Update stats
-                TOTAL_FILES += 1
-                TOTAL_BYTES += file_info['size']
-                uploaded += 1
-                
-                # Update queue progress
-                if queue_id and queue_id in UPLOAD_QUEUE:
-                    UPLOAD_QUEUE[queue_id]['progress'] = uploaded
-                
-                # Clean up local file
-                try:
-                    os.remove(local_path)
-                except:
-                    pass
+                successful += 1
+                logger.info(f"✅ Downloaded and sent: {filename}")
                 
             except Exception as e:
-                logger.error(f"Failed to upload {file_info['name']}: {e}")
-                failed.append(file_info['name'])
+                logger.error(f"❌ Error downloading {file_id}: {e}")
+                failed += 1
         
-        # Final summary
-        summary = f"✅ **Upload Complete**\n\n"
-        summary += f"📤 Uploaded: {uploaded}/{total_files}\n"
+        # Final status
+        await status_msg.edit_text(
+            f"✅ **Download Complete!**\n\n"
+            f"✅ Successful: {successful}/{total_files}\n"
+            f"❌ Failed: {failed}"
+        )
+    
+    except Exception as e:
+        logger.error(f"Download task error: {e}")
+        await status_msg.edit_text(f"❌ **Error:** {str(e)}")
+    
+    finally:
+        if task_id in ACTIVE_TASKS:
+            del ACTIVE_TASKS[task_id]
+
+def upload_to_drive_with_progress(service, file_path, file_metadata, message_data, filename):
+    """
+    Upload file to Google Drive with progress tracking
+    message_data is a dict with {'chat_id': int, 'message_id': int, 'bot': Client, 'task_id': str}
+    """
+    try:
+        media = MediaFileUpload(
+            file_path,
+            resumable=True,
+            chunksize=5*1024*1024  # 5 MB chunks for better progress updates
+        )
         
-        if failed:
-            summary += f"❌ Failed: {len(failed)}\n"
-            summary += f"Files: {', '.join(failed[:5])}"
-            if len(failed) > 5:
-                summary += f"... and {len(failed)-5} more"
+        request = service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields='id, size, webViewLink',
+            supportsAllDrives=True
+        )
         
-        if series_name:
-            summary += f"\n📁 Series: {series_name}"
+        response = None
+        last_progress = 0
+        last_update = time.time()
+        file_size = os.path.getsize(file_path)
+        start_time = time.time()
+        last_uploaded = 0
         
-        summary += f"\n📊 Total: {format_size(TOTAL_BYTES)}"
+        while response is None:
+            # Check for cancellation
+            task_id = message_data.get('task_id')
+            if task_id and ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
+                message_data['cancelled'] = True
+                return None
+            
+            status, response = request.next_chunk()
+            
+            if status:
+                progress = int(status.progress() * 100)
+                current_bytes = int(status.progress() * file_size)
+                now = time.time()
+                
+                # Update every 2 seconds or on significant progress change
+                if (now - last_update) > 2 or progress - last_progress >= 5:
+                    # Calculate speed
+                    time_diff = now - last_update if (now - last_update) > 0 else 0.1
+                    bytes_diff = current_bytes - last_uploaded
+                    speed = bytes_diff / time_diff if time_diff > 0 else 0
+                    
+                    # Progress bar
+                    filled = int(progress // 10)
+                    bar = '■' * filled + '□' * (10 - filled)
+                    
+                    # ETA
+                    if speed > 0 and current_bytes < file_size:
+                        remaining = file_size - current_bytes
+                        eta_seconds = remaining / speed
+                        eta = str(datetime.timedelta(seconds=int(eta_seconds)))
+                    else:
+                        eta = "Calculating..." if current_bytes < file_size else "Done"
+                    
+                    # Update message (will be called from executor, but we store the data)
+                    message_data['last_progress'] = {
+                        'bar': bar,
+                        'progress': progress,
+                        'speed': speed,
+                        'current': current_bytes,
+                        'total': file_size,
+                        'eta': eta,
+                        'filename': filename
+                    }
+                    
+                    last_progress = progress
+                    last_update = now
+                    last_uploaded = current_bytes
         
-        await status_msg.edit_text(summary)
+        # Mark as complete
+        message_data['complete'] = True
+        return response
+    
+    except Exception as e:
+        logger.error(f"Upload error: {e}")
+        message_data['error'] = str(e)
+        raise
+
+# ==================== PROGRESS CALLBACK ====================
+async def progress_callback(current, total, message, start_time, filename, task_id):
+    """Show upload/download progress with accurate speed and cancellation support"""
+    # Check for cancellation
+    if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
+        raise Exception("Download cancelled by user")
+    
+    now = time.time()
+    
+    # Initialize tracking variables
+    if not hasattr(message, 'last_update'):
+        message.last_update = 0
+        message.last_current = 0
+        message.last_time = start_time
+    
+    # Update every 2 seconds or on completion
+    if (now - message.last_update) > 2 or current == total:
+        # Calculate incremental speed (more accurate)
+        time_diff = now - message.last_time
+        bytes_diff = current - message.last_current
+        
+        if time_diff > 0:
+            speed = bytes_diff / time_diff  # Bytes per second
+        else:
+            speed = 0
+        
+        percentage = (current / total) * 100
+        
+        # Progress bar
+        filled = int(percentage // 10)
+        bar = '■' * filled + '□' * (10 - filled)
+        
+        # ETA calculation
+        if speed > 0 and current < total:
+            remaining_bytes = total - current
+            eta_seconds = remaining_bytes / speed
+            eta = str(datetime.timedelta(seconds=int(eta_seconds)))
+        else:
+            eta = "Calculating..." if current < total else "Done"
+        
+        try:
+            cancel_button = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🛑 Cancel Upload", callback_data=f"cancel_{task_id}")]
+            ])
+            
+            await message.edit_text(
+                f"📊 **Progress**\n"
+                f"📄 `{filename[:40]}...`\n\n"
+                f"[{bar}] {percentage:.1f}%\n"
+                f"⚡ Speed: {speed/1024/1024:.2f} MB/s\n"
+                f"💾 {current/1024/1024:.1f} MB / {total/1024/1024:.1f} MB\n"
+                f"⏱️ ETA: {eta}",
+                reply_markup=cancel_button
+            )
+        except Exception:
+            pass
+        
+        # Update tracking variables
+        message.last_update = now
+        message.last_current = current
+        message.last_time = now
+
+async def upload_task(client: Client, status_msg: Message, file_list: list, series_name: str = None, flat_upload: bool = False, queue_id: str = None):
+    """
+    Main upload task - handles batch uploading with proper organization and cancellation
+    
+    Args:
+        client: Pyrogram client
+        status_msg: Status message to update
+        file_list: List of dicts with 'msg_id' and 'name'
+        series_name: Optional series name for organization
+        flat_upload: If True, upload directly to parent folder without subfolders
+        queue_id: Optional queue ID for tracking
+    """
+    global TOTAL_FILES, TOTAL_BYTES
+    
+    task_id = f"{status_msg.chat.id}_{status_msg.id}"
+    ACTIVE_TASKS[task_id] = {
+        'cancelled': False, 
+        'files_list': file_list,
+        'current_file': None,
+        'progress': 0,
+        'status': 'initializing'
+    }
+    
+    # Update queue status
+    if queue_id and queue_id in UPLOAD_QUEUE:
+        UPLOAD_QUEUE[queue_id]['status'] = 'uploading'
+    
+    service = get_drive_service()
+    if not service:
+        await status_msg.edit_text("❌ **Failed to connect to Google Drive!**\n\nPlease check TOKEN_JSON configuration.")
+        if task_id in ACTIVE_TASKS:
+            del ACTIVE_TASKS[task_id]
+        if queue_id and queue_id in UPLOAD_QUEUE:
+            UPLOAD_QUEUE[queue_id]['status'] = 'failed'
+        return
+    
+    try:
+        await status_msg.edit_text(f"🔄 **Preparing folders...**\n📦 Files to upload: {len(file_list)}")
+        
+        # Determine parent folder
+        if series_name and not flat_upload:
+            # Create series folder
+            parent_folder = get_or_create_folder(service, series_name, DRIVE_FOLDER_ID)
+            if not parent_folder:
+                await status_msg.edit_text(f"❌ **Failed to create series folder:** {series_name}")
+                if task_id in ACTIVE_TASKS:
+                    del ACTIVE_TASKS[task_id]
+                if queue_id and queue_id in UPLOAD_QUEUE:
+                    UPLOAD_QUEUE[queue_id]['status'] = 'failed'
+                return
+        else:
+            parent_folder = DRIVE_FOLDER_ID
+        
+        # Create downloads directory if not exists
+        os.makedirs("downloads", exist_ok=True)
+        
+        successful_uploads = 0
+        failed_uploads = []
+        total_size_uploaded = 0
+        start_time = time.time()
+        
+        # Process each file
+        for idx, file_info in enumerate(file_list, 1):
+            # Check for cancellation
+            if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
+                await status_msg.edit_text(
+                    f"🛑 **Upload Cancelled**\n\n"
+                    f"✅ Uploaded: {successful_uploads}/{len(file_list)}\n"
+                    f"❌ Failed: {len(failed_uploads)}\n"
+                    f"📊 Total: {format_size(total_size_uploaded)}\n"
+                    f"⏱️ Time: {format_time(time.time() - start_time)}"
+                )
+                if task_id in ACTIVE_TASKS:
+                    del ACTIVE_TASKS[task_id]
+                if queue_id and queue_id in UPLOAD_QUEUE:
+                    UPLOAD_QUEUE[queue_id]['status'] = 'cancelled'
+                return
+            
+            filename = file_info['name']
+            msg_id = file_info['msg_id']
+            download_path = None
+            
+            # Clean the filename (replace underscores with spaces)
+            clean_name = clean_filename(filename)
+            
+            # Update task progress
+            ACTIVE_TASKS[task_id]['current_file'] = filename
+            ACTIVE_TASKS[task_id]['progress'] = int((idx - 1) / len(file_list) * 100)
+            ACTIVE_TASKS[task_id]['status'] = 'downloading'
+            
+            # Auto-retry logic
+            retry_count = 0
+            upload_success = False
+            
+            while retry_count < MAX_RETRIES and not upload_success:
+                try:
+                    # Update status with retry info
+                    retry_text = f" (Retry {retry_count}/{MAX_RETRIES})" if retry_count > 0 else ""
+                    
+                    # Create cancel button
+                    cancel_button = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🛑 Cancel Upload", callback_data=f"cancel_{task_id}")]
+                    ])
+                    
+                    await status_msg.edit_text(
+                        f"📥 **Downloading ({idx}/{len(file_list)}){retry_text}**\n"
+                        f"📄 `{filename[:50]}...`\n"
+                        f"✅ {successful_uploads} | ❌ {len(failed_uploads)}\n"
+                        f"📊 Progress: {int((idx-1)/len(file_list)*100)}%",
+                        reply_markup=cancel_button
+                    )
+                    
+                    # Download file
+                    download_path = f"downloads/{filename}"
+                    download_start = time.time()
+                    
+                    try:
+                        # Get the message object
+                        message = await client.get_messages(status_msg.chat.id, msg_id)
+                        
+                        await client.download_media(
+                            message,
+                            file_name=download_path,
+                            progress=progress_callback,
+                            progress_args=(status_msg, download_start, filename, task_id)
+                        )
+                    except FloodWait as e:
+                        logger.warning(f"FloodWait: Sleeping for {e.value} seconds")
+                        await asyncio.sleep(e.value)
+                        # Retry download
+                        message = await client.get_messages(status_msg.chat.id, msg_id)
+                        await client.download_media(
+                            message,
+                            file_name=download_path,
+                            progress=progress_callback,
+                            progress_args=(status_msg, download_start, filename, task_id)
+                        )
+                    
+                    # Check for cancellation after download
+                    if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
+                        if download_path and os.path.exists(download_path):
+                            os.remove(download_path)
+                        await status_msg.edit_text(
+                            f"🛑 **Upload Cancelled**\n\n"
+                            f"✅ Uploaded: {successful_uploads}/{len(file_list)}\n"
+                            f"❌ Failed: {len(failed_uploads)}"
+                        )
+                        if task_id in ACTIVE_TASKS:
+                            del ACTIVE_TASKS[task_id]
+                        if queue_id and queue_id in UPLOAD_QUEUE:
+                            UPLOAD_QUEUE[queue_id]['status'] = 'cancelled'
+                        return
+                    
+                    if not os.path.exists(download_path):
+                        raise Exception("Download failed - file not found")
+                    
+                    file_size = os.path.getsize(download_path)
+                    
+                    # Update task status
+                    ACTIVE_TASKS[task_id]['status'] = 'uploading'
+                    
+                    # Handle Folder Logic
+                    if flat_upload:
+                        # Not an Audiobook: Upload directly to Root/Parent
+                        upload_folder = parent_folder
+                    else:
+                        # Standard behavior: Create individual folder for the file
+                        # Use cleaned name without extension for folder
+                        folder_name = os.path.splitext(clean_name)[0]
+                        file_folder = get_or_create_folder(service, folder_name, parent_folder)
+                        
+                        if not file_folder:
+                            raise Exception("Failed to create file folder")
+                        
+                        upload_folder = file_folder
+                    
+                    # Upload to Drive with progress
+                    file_metadata = {
+                        'name': clean_name,  # Use cleaned filename
+                        'parents': [upload_folder]
+                    }
+                    
+                    # Initial upload message
+                    cancel_button = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🛑 Cancel Upload", callback_data=f"cancel_{task_id}")]
+                    ])
+                    
+                    await status_msg.edit_text(
+                        f"☁️ **Uploading to Drive ({idx}/{len(file_list)}){retry_text}**\n"
+                        f"📄 `{filename[:50]}...`\n"
+                        f"💾 Size: {file_size/1024/1024:.2f} MB\n"
+                        f"✅ {successful_uploads} | ❌ {len(failed_uploads)}\n"
+                        f"📊 Progress: {int((idx-1)/len(file_list)*100)}%\n\n"
+                        f"Starting upload...",
+                        reply_markup=cancel_button
+                    )
+                    
+                    # Shared data for progress tracking
+                    progress_data = {
+                        'complete': False, 
+                        'error': None, 
+                        'last_progress': None,
+                        'task_id': task_id,
+                        'cancelled': False
+                    }
+                    
+                    # Start upload in executor
+                    loop = asyncio.get_running_loop()
+                    upload_future = loop.run_in_executor(
+                        None,
+                        upload_to_drive_with_progress,
+                        service,
+                        download_path,
+                        file_metadata,
+                        progress_data,
+                        filename
+                    )
+                    
+                    # Monitor progress while upload is running
+                    while not progress_data.get('complete') and not progress_data.get('error') and not progress_data.get('cancelled'):
+                        # Check for cancellation
+                        if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
+                            progress_data['cancelled'] = True
+                            break
+                        
+                        if progress_data.get('last_progress'):
+                            p = progress_data['last_progress']
+                            try:
+                                await status_msg.edit_text(
+                                    f"☁️ **Uploading to Drive ({idx}/{len(file_list)}){retry_text}**\n"
+                                    f"📄 `{p['filename'][:40]}...`\n\n"
+                                    f"[{p['bar']}] {p['progress']}%\n"
+                                    f"⚡ Speed: {p['speed']/1024/1024:.2f} MB/s\n"
+                                    f"💾 {p['current']/1024/1024:.1f} MB / {p['total']/1024/1024:.1f} MB\n"
+                                    f"⏱️ ETA: {p['eta']}\n\n"
+                                    f"✅ {successful_uploads} | ❌ {len(failed_uploads)}\n"
+                                    f"📊 Overall: {int((idx-1)/len(file_list)*100)}%"
+                                )
+                            except:
+                                pass
+                        
+                        # Check every second
+                        await asyncio.sleep(1)
+                    
+                    # Check if cancelled during upload
+                    if progress_data.get('cancelled') or ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
+                        if download_path and os.path.exists(download_path):
+                            os.remove(download_path)
+                        await status_msg.edit_text(
+                            f"🛑 **Upload Cancelled**\n\n"
+                            f"✅ Uploaded: {successful_uploads}/{len(file_list)}\n"
+                            f"❌ Failed: {len(failed_uploads)}"
+                        )
+                        if task_id in ACTIVE_TASKS:
+                            del ACTIVE_TASKS[task_id]
+                        if queue_id and queue_id in UPLOAD_QUEUE:
+                            UPLOAD_QUEUE[queue_id]['status'] = 'cancelled'
+                        return
+                    
+                    # Wait for upload to complete
+                    upload_result = await upload_future
+                    
+                    if progress_data.get('error'):
+                        raise Exception(progress_data['error'])
+                    
+                    if upload_result is None:
+                        raise Exception("Upload was cancelled")
+                    
+                    # Update stats
+                    uploaded_size = int(upload_result.get('size', file_size))
+                    TOTAL_FILES += 1
+                    TOTAL_BYTES += uploaded_size
+                    total_size_uploaded += uploaded_size
+                    
+                    # Clean up downloaded file
+                    if os.path.exists(download_path):
+                        os.remove(download_path)
+                    
+                    successful_uploads += 1
+                    upload_success = True
+                    logger.info(f"✅ Uploaded: {filename} ({uploaded_size/1024/1024:.2f} MB)")
+                
+                except Exception as e:
+                    retry_count += 1
+                    logger.error(f"❌ Error uploading {filename} (attempt {retry_count}/{MAX_RETRIES}): {e}")
+                    
+                    if retry_count < MAX_RETRIES:
+                        # Wait before retry with exponential backoff
+                        wait_time = RETRY_DELAY * (2 ** (retry_count - 1))
+                        logger.info(f"Retrying in {wait_time} seconds...")
+                        await asyncio.sleep(wait_time)
+                    else:
+                        # Max retries reached
+                        failed_uploads.append(f"{filename}: {str(e)[:50]}")
+                        record_failed_upload(task_id, filename, e)
+                    
+                    # Clean up on error
+                    if download_path and os.path.exists(download_path):
+                        try:
+                            os.remove(download_path)
+                        except:
+                            pass
+        
+        # Update task progress
+        ACTIVE_TASKS[task_id]['progress'] = 100
+        ACTIVE_TASKS[task_id]['status'] = 'completed'
         
         # Save stats
-        sync_stats(service, save=True)
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, sync_stats, service, True)
+        except Exception as e:
+            logger.error(f"Failed to save stats: {e}")
         
-        # Remove from queue
+        # Final status
+        elapsed_time = time.time() - start_time
+        location_text = "Root (No Folders)" if flat_upload else (f"**{series_name}**" if series_name else "Root -> Standalone")
+        
+        status_text = f"✅ **Upload Complete!**\n\n"
+        status_text += f"📁 Location: {location_text}\n"
+        status_text += f"✅ Successful: {successful_uploads}/{len(file_list)}\n"
+        status_text += f"📊 Total Size: {format_size(total_size_uploaded)}\n"
+        status_text += f"⏱️ Time: {format_time(elapsed_time)}\n"
+        
+        if elapsed_time > 0:
+            status_text += f"⚡ Avg Speed: {format_size(total_size_uploaded/elapsed_time)}/s\n"
+        
+        if failed_uploads:
+            status_text += f"\n❌ **Failed: {len(failed_uploads)}**\n"
+            status_text += f"Use `/retry` to retry failed uploads\n\n**Errors:**\n"
+            for error in failed_uploads[:5]:  # Show first 5 errors
+                status_text += f"• {error}\n"
+        
+        status_text += f"\n📈 **Total Stats:** {TOTAL_FILES} files | {TOTAL_BYTES/1024/1024/1024:.2f} GB"
+        
+        await status_msg.edit_text(status_text)
+        
+        # Update queue status
         if queue_id and queue_id in UPLOAD_QUEUE:
-            del UPLOAD_QUEUE[queue_id]
+            UPLOAD_QUEUE[queue_id]['status'] = 'completed' if not failed_uploads else 'completed_with_errors'
     
     except Exception as e:
         logger.error(f"Upload task error: {e}")
-        await status_msg.edit_text(f"❌ Upload failed: {str(e)}")
+        await status_msg.edit_text(f"❌ **Error:** {str(e)}")
+        if queue_id and queue_id in UPLOAD_QUEUE:
+            UPLOAD_QUEUE[queue_id]['status'] = 'failed'
     
     finally:
         # Clean up task
         if task_id in ACTIVE_TASKS:
             del ACTIVE_TASKS[task_id]
-
-# ==================== HELPER FUNCTIONS ====================
-def format_size(size_bytes):
-    """Format bytes to human readable"""
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if size_bytes < 1024.0:
-            return f"{size_bytes:.2f} {unit}"
-        size_bytes /= 1024.0
-    return f"{size_bytes:.2f} PB"
-
-def clean_series_name(filename):
-    """Extract series name from filename"""
-    # Remove file extension
-    name = os.path.splitext(filename)[0]
-    
-    # Remove common patterns
-    patterns = [
-        r'\[.*?\]',  # [tags]
-        r'\(.*?\)',  # (info)
-        r'\d+x\d+',  # Episode numbers
-        r'[Ss]\d+[Ee]\d+',  # S01E01
-        r'\d{3,4}p',  # Quality
-        r'\.', # Dots
-    ]
-    
-    for pattern in patterns:
-        name = re.sub(pattern, ' ', name)
-    
-    # Clean up whitespace
-    name = ' '.join(name.split())
-    
-    return name.strip()
-
-# ==================== BOT COMMANDS ====================
+# ==================== BOT HANDLERS ====================
 @app.on_message(filters.command("start") & filters.user(OWNER_ID))
-async def start_command(client, message: Message):
-    """Start command"""
+async def start_command(client, message):
+    """Welcome message"""
     await message.reply_text(
-        "🤖 **RxUploader Bot**\n\n"
-        "Send me files to upload to Google Drive!\n\n"
-        "**Commands:**\n"
-        "/browse - Browse Drive files\n"
-        "/search <query> - Search files\n"
-        "/stats - View statistics\n"
-        "/queue - Check upload queue\n"
-        "/favorites - Manage favorites"
+        "🤖 **Hi, I'm RxUploader**\n\n"
+        "📤 Send me files and I'll upload them to Rx's Google Drive!\n"
+        "📥 Or browse your Drive and download to Telegram!\n\n"
+        "**Upload Commands:**\n"
+        "/start - Wake me up!\n"
+        "/stats - View upload statistics\n"
+        "/status - Detailed status of all operations\n"
+        "/queue - View upload queue\n"
+        "/cancel - Cancel active upload/download\n"
+        "/retry - View and retry failed uploads\n"
+        "/clearfailed - Clear failed uploads history\n\n"
+        "**Download Commands:**\n"
+        "/browse - 📁 Browse Google Drive files\n"
+        "/search <query> - 🔍 Search Drive\n"
+        "/favorites - ⭐ Quick access favorites\n\n"
+        "**Features:**\n"
+        "• Multi support with auto-detection\n"
+        "• Series organization (auto or custom)\n"
+        "• Queue management\n"
+        "• Real-time progress tracking\n"
+        "• Auto-retry on errors (up to 3 attempts)\n"
+        "• File browser with multi-select\n"
+        "• Cancel anytime\n\n"
+        "Send me the next Audiobook or /browse to download!"
     )
 
 @app.on_message(filters.command("stats") & filters.user(OWNER_ID))
-async def stats_command(client, message: Message):
-    """Show bot statistics"""
-    uptime = time.time() - START_TIME
-    hours = int(uptime // 3600)
-    minutes = int((uptime % 3600) // 60)
+async def stats_command(client, message):
+    """Show upload statistics"""
+    uptime = str(datetime.timedelta(seconds=int(time.time() - START_TIME)))
     
     stats_text = (
         f"📊 **Bot Statistics**\n\n"
-        f"⏱ Uptime: {hours}h {minutes}m\n"
-        f"📁 Total Files: {TOTAL_FILES:,}\n"
-        f"💾 Total Size: {format_size(TOTAL_BYTES)}\n"
-        f"📋 Queue Size: {len(UPLOAD_QUEUE)}\n"
-        f"🔄 Active Tasks: {len(ACTIVE_TASKS)}"
+        f"⏱️ **Uptime:** `{uptime}`\n"
+        f"📁 **Total Files:** `{TOTAL_FILES:,}`\n"
+        f"💾 **Total Data:** `{TOTAL_BYTES/1024/1024/1024:.2f} GB`\n"
     )
+    
+    if TOTAL_FILES > 0:
+        stats_text += f"📈 **Average File Size:** `{(TOTAL_BYTES/TOTAL_FILES/1024/1024):.2f} MB`"
+    
+    # Show active tasks
+    if ACTIVE_TASKS:
+        stats_text += f"\n\n🔄 **Active Tasks:** {len(ACTIVE_TASKS)}"
     
     await message.reply_text(stats_text)
 
-@app.on_message(filters.command("browse") & filters.user(OWNER_ID))
-async def browse_command(client, message: Message):
-    """Browse Google Drive files"""
-    service = get_drive_service()
-    if not service:
-        await message.reply_text("❌ Failed to connect to Google Drive")
+@app.on_message(filters.command("cancel") & filters.user(OWNER_ID))
+async def cancel_command(client, message):
+    """Cancel active upload/download tasks"""
+    if not ACTIVE_TASKS:
+        await message.reply_text("ℹ️ No active tasks to cancel")
         return
     
-    user_id = message.from_user.id
-    
-    # Initialize or reset session
-    BROWSER_SESSIONS[user_id] = {
-        'current_folder': DRIVE_FOLDER_ID,
-        'path': [],
-        'selected_files': [],
-        'page': 0
-    }
-    
-    # List files
-    folders, files, _ = list_drive_files(service, DRIVE_FOLDER_ID)
-    total_items = len(folders) + len(files)
-    
-    keyboard = build_browser_keyboard(user_id, folders, files, total_items)
-    breadcrumb = get_breadcrumb(BROWSER_SESSIONS[user_id])
+    # Cancel all active tasks
+    cancelled_count = 0
+    for task_id in list(ACTIVE_TASKS.keys()):
+        ACTIVE_TASKS[task_id]['cancelled'] = True
+        cancelled_count += 1
+        logger.info(f"Cancelling task: {task_id}")
     
     await message.reply_text(
-        f"📁 **File Browser**\n"
-        f"📍 {breadcrumb}\n"
-        f"📊 {len(folders)} folders, {len(files)} files",
-        reply_markup=keyboard
+        f"🛑 **Cancellation Requested**\n\n"
+        f"Tasks being cancelled: {cancelled_count}\n"
+        f"Please wait for tasks to stop..."
     )
 
-@app.on_message(filters.command("search") & filters.user(OWNER_ID))
-async def search_command(client, message: Message):
-    """Search for files in Drive"""
-    # Extract search query
-    query_text = message.text.replace("/search", "").strip()
-    
-    if not query_text:
-        await message.reply_text("❓ Usage: /search <query>")
-        return
-    
-    service = get_drive_service()
-    if not service:
-        await message.reply_text("❌ Failed to connect to Google Drive")
-        return
-    
-    # Search
-    status = await message.reply_text(f"🔍 Searching for: `{query_text}`...")
-    results = search_drive(service, query_text)
-    
-    if not results:
-        await status.edit_text(f"❌ No results found for: `{query_text}`")
-        return
-    
-    # Format results
-    response = f"🔍 **Search Results** ({len(results)})\n\n"
-    
-    for item in results[:20]:  # Limit to 20 results
-        icon = "📁" if item['mimeType'] == 'application/vnd.google-apps.folder' else "📄"
-        name = item['name']
-        size = format_size(int(item.get('size', 0))) if 'size' in item else "N/A"
-        response += f"{icon} `{name}`\n└ Size: {size}\n\n"
-    
-    if len(results) > 20:
-        response += f"... and {len(results)-20} more results"
-    
-    await status.edit_text(response)
-
 @app.on_message(filters.command("queue") & filters.user(OWNER_ID))
-async def queue_command(client, message: Message):
-    """Check upload queue"""
-    status = get_queue_status()
-    await message.reply_text(status)
+async def queue_command(client, message):
+    """Show current upload queue"""
+    queue_text = get_queue_status()
+    
+    if ACTIVE_TASKS:
+        queue_text += f"\n\n🔄 **Active Tasks:** {len(ACTIVE_TASKS)}\n"
+        for task_id, task_data in ACTIVE_TASKS.items():
+            current_file = task_data.get('current_file', 'N/A')
+            progress = task_data.get('progress', 0)
+            status = task_data.get('status', 'unknown')
+            queue_text += f"\n📌 `{task_id[:20]}...`\n"
+            queue_text += f"  File: {current_file[:30]}...\n"
+            queue_text += f"  Progress: {progress}% | Status: {status}\n"
+    
+    await message.reply_text(queue_text)
+
+@app.on_message(filters.command("status") & filters.user(OWNER_ID))
+async def status_command(client, message):
+    """Show detailed status of all operations"""
+    status_text = "📊 **Bot Status**\n\n"
+    
+    # Active tasks
+    if ACTIVE_TASKS:
+        status_text += f"🔄 **Active Uploads:** {len(ACTIVE_TASKS)}\n\n"
+        for task_id, task_data in ACTIVE_TASKS.items():
+            current_file = task_data.get('current_file', 'Initializing...')
+            progress = task_data.get('progress', 0)
+            status = task_data.get('status', 'unknown')
+            files_count = len(task_data.get('files_list', []))
+            
+            status_text += f"📌 Task: `{task_id[:25]}...`\n"
+            status_text += f"  📄 Current: {current_file[:35]}...\n"
+            status_text += f"  📊 Progress: {progress}%\n"
+            status_text += f"  📁 Total Files: {files_count}\n"
+            status_text += f"  🔧 Status: {status}\n\n"
+    else:
+        status_text += "✅ No active uploads\n\n"
+    
+    # Queue status
+    if UPLOAD_QUEUE:
+        status_text += f"📋 **Queued Tasks:** {len(UPLOAD_QUEUE)}\n"
+        for queue_id, data in list(UPLOAD_QUEUE.items())[:5]:  # Show first 5
+            status_text += f"  • {queue_id}: {len(data['files'])} files ({data['status']})\n"
+    else:
+        status_text += "📭 Queue is empty\n"
+    
+    # Failed uploads
+    if FAILED_UPLOADS:
+        status_text += f"\n❌ **Failed Uploads:** {len(FAILED_UPLOADS)} tasks\n"
+        total_failed = sum(len(data['files']) for data in FAILED_UPLOADS.values())
+        status_text += f"  Total failed files: {total_failed}\n"
+        status_text += f"  Use `/retry` to retry\n"
+    
+    # System stats
+    uptime = str(datetime.timedelta(seconds=int(time.time() - START_TIME)))
+    status_text += f"\n⏱️ **Uptime:** {uptime}\n"
+    status_text += f"📈 **Total Uploaded:** {TOTAL_FILES} files ({TOTAL_BYTES/1024/1024/1024:.2f} GB)"
+    
+    await message.reply_text(status_text)
+
+@app.on_message(filters.command("retry") & filters.user(OWNER_ID))
+async def retry_command(client, message):
+    """Retry failed uploads"""
+    if not FAILED_UPLOADS:
+        await message.reply_text("✅ No failed uploads to retry")
+        return
+    
+    # Show failed uploads
+    retry_text = "🔄 **Failed Uploads Available for Retry**\n\n"
+    
+    for task_id, data in list(FAILED_UPLOADS.items())[:5]:  # Show first 5 tasks
+        retry_text += f"📌 Task: `{task_id[:25]}...`\n"
+        retry_text += f"  Failed files: {len(data['files'])}\n"
+        retry_text += f"  Time: {format_time(time.time() - data['timestamp'])} ago\n"
+        
+        # Show first 3 errors
+        for error in data['errors'][:3]:
+            retry_text += f"  • {error}\n"
+        
+        if len(data['errors']) > 3:
+            retry_text += f"  ... and {len(data['errors']) - 3} more\n"
+        retry_text += "\n"
+    
+    total_failed = sum(len(data['files']) for data in FAILED_UPLOADS.values())
+    retry_text += f"**Total:** {total_failed} failed files across {len(FAILED_UPLOADS)} tasks\n\n"
+    retry_text += "⚠️ Automatic retry is now built-in!\n"
+    retry_text += f"Failed uploads are retried up to {MAX_RETRIES} times automatically.\n\n"
+    retry_text += "Use `/clearfailed` to clear failed uploads history"
+    
+    await message.reply_text(retry_text)
+
+@app.on_message(filters.command("clearfailed") & filters.user(OWNER_ID))
+async def clearfailed_command(client, message):
+    """Clear failed uploads history"""
+    if not FAILED_UPLOADS:
+        await message.reply_text("ℹ️ No failed uploads to clear")
+        return
+    
+    count = len(FAILED_UPLOADS)
+    FAILED_UPLOADS.clear()
+    await message.reply_text(f"🗑️ Cleared {count} failed upload records")
+
+@app.on_message(filters.command("browse") & filters.user(OWNER_ID))
+async def browse_command(client, message):
+    """Browse Google Drive files"""
+    try:
+        service = get_drive_service()
+        if not service:
+            await message.reply_text("❌ Failed to connect to Google Drive")
+            return
+        
+        user_id = message.from_user.id
+        session = get_browser_session(user_id)
+        
+        # Reset to root
+        session['current_folder'] = DRIVE_FOLDER_ID
+        session['path'] = [{'name': 'My Drive', 'id': DRIVE_FOLDER_ID}]
+        session['selected_files'] = []
+        session['page'] = 0
+        
+        # List files
+        folders, files, _ = list_drive_files(service, DRIVE_FOLDER_ID)
+        total_items = len(folders) + len(files)
+        
+        if total_items == 0:
+            await message.reply_text("📁 Folder is empty")
+            return
+        
+        # Build keyboard
+        keyboard = build_browser_keyboard(user_id, folders, files, total_items)
+        breadcrumb = get_breadcrumb(session)
+        
+        await message.reply_text(
+            f"📁 **File Browser**\n"
+            f"📍 {breadcrumb}\n"
+            f"📊 {len(folders)} folders, {len(files)} files",
+            reply_markup=keyboard
+        )
+    
+    except Exception as e:
+        logger.error(f"Browse error: {e}")
+        await message.reply_text(f"❌ Error: {str(e)}")
+
+@app.on_message(filters.command("search") & filters.user(OWNER_ID))
+async def search_command(client, message):
+    """Search Google Drive"""
+    try:
+        # Extract search query
+        query = message.text.split(maxsplit=1)[1] if len(message.text.split()) > 1 else None
+        
+        if not query:
+            await message.reply_text("🔍 **Search Drive**\n\nUsage: `/search <query>`\n\nExample: `/search Harry Potter`")
+            return
+        
+        service = get_drive_service()
+        if not service:
+            await message.reply_text("❌ Failed to connect to Google Drive")
+            return
+        
+        status = await message.reply_text(f"🔍 Searching for: `{query}`...")
+        
+        # Search
+        folders, files = search_drive_files(service, query)
+        total_results = len(folders) + len(files)
+        
+        if total_results == 0:
+            await status.edit_text(f"🔍 No results found for: `{query}`")
+            return
+        
+        # Build keyboard for results
+        user_id = message.from_user.id
+        session = get_browser_session(user_id)
+        session['page'] = 0
+        session['selected_files'] = []
+        
+        keyboard = build_browser_keyboard(user_id, folders, files, total_results)
+        
+        await status.edit_text(
+            f"🔍 **Search Results**\n"
+            f"Query: `{query}`\n"
+            f"📊 Found {len(folders)} folders, {len(files)} files",
+            reply_markup=keyboard
+        )
+    
+    except IndexError:
+        await message.reply_text("🔍 **Search Drive**\n\nUsage: `/search <query>`\n\nExample: `/search Harry Potter`")
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        await message.reply_text(f"❌ Error: {str(e)}")
 
 @app.on_message(filters.command("favorites") & filters.user(OWNER_ID))
-async def favorites_command(client, message: Message):
-    """Show favorites"""
+async def favorites_command(client, message):
+    """Show favorite folders"""
     user_id = message.from_user.id
     
     if user_id not in FAVORITES or not FAVORITES[user_id]:
-        await message.reply_text("⭐ No favorites yet!")
+        await message.reply_text(
+            "⭐ **Favorites**\n\n"
+            "You don't have any favorite folders yet!\n\n"
+            "Browse to a folder and use the ⭐ button to add it to favorites."
+        )
         return
     
-    favs = FAVORITES[user_id]
-    response = f"⭐ **Your Favorites** ({len(favs)})\n\n"
+    keyboard = []
+    for fav in FAVORITES[user_id]:
+        keyboard.append([InlineKeyboardButton(
+            f"📁 {fav['name']}", 
+            callback_data=f"browser_open|{fav['id']}"
+        )])
     
-    for fav in favs:
-        response += f"📁 {fav['name']}\n"
-    
-    # Add clear button
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🗑️ Clear All", callback_data="browser_clear_favs")]
-    ])
-    
-    await message.reply_text(response, reply_markup=keyboard)
-
-# ==================== FILE HANDLERS ====================
-@app.on_message((filters.document | filters.video | filters.audio) & filters.user(OWNER_ID))
-async def handle_media(client, message: Message):
-    """Handle incoming media files"""
-    global ALBUMS
-    
-    # Get file info
-    media = message.document or message.video or message.audio
-    file_name = getattr(media, 'file_name', f"file_{int(time.time())}")
-    file_size = media.file_size
-    caption = message.caption
-    
-    file_info = {
-        'name': file_name,
-        'size': file_size,
-        'caption': caption,
-        'message_id': message.id,
-        'chat_id': message.chat.id
-    }
-    
-    # Check if part of an album
-    if message.media_group_id:
-        group_id = message.media_group_id
-        
-        if group_id not in ALBUMS:
-            ALBUMS[group_id] = {
-                'files': [],
-                'timer': None,
-                'first_msg': message
-            }
-        
-        ALBUMS[group_id]['files'].append(file_info)
-        
-        # Cancel existing timer
-        if ALBUMS[group_id]['timer']:
-            ALBUMS[group_id]['timer'].cancel()
-        
-        # Set new timer (2 seconds to collect all files in album)
-        async def process_album():
-            await asyncio.sleep(2)
-            if group_id in ALBUMS:
-                await show_upload_options(client, ALBUMS[group_id]['first_msg'], ALBUMS[group_id]['files'])
-                del ALBUMS[group_id]
-        
-        ALBUMS[group_id]['timer'] = asyncio.create_task(process_album())
-    
-    else:
-        # Single file
-        await show_upload_options(client, message, [file_info])
-
-async def show_upload_options(client, message: Message, file_list):
-    """Show upload mode selection"""
-    key = f"upload_{int(time.time())}_{message.from_user.id}"
-    TEMP_FILES[key] = file_list
-    
-    # Detect series name from first file
-    first_file = file_list[0]['name']
-    auto_series = clean_series_name(first_file)
-    
-    # Check for caption
-    has_caption = any(f.get('caption') for f in file_list)
-    caption_name = next((f['caption'] for f in file_list if f.get('caption')), None)
-    
-    # Build keyboard
-    keyboard = [
-        [InlineKeyboardButton("📁 Standalone (Each file = 1 folder)", callback_data=f"std|{key}")],
-        [InlineKeyboardButton("📂 Root (No folders)", callback_data=f"root|{key}")]
-    ]
-    
-    if len(file_list) > 1:
-        if has_caption:
-            keyboard.append([InlineKeyboardButton(f"📚 Series: {caption_name}", callback_data=f"cap|{key}")])
-        
-        keyboard.append([InlineKeyboardButton(f"🤖 Auto: {auto_series}", callback_data=f"auto|{key}")])
-        keyboard.append([InlineKeyboardButton("✏️ Custom Series Name", callback_data=f"custom|{key}")])
-    
-    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_selection|{key}")])
-    
-    total_size = sum(f['size'] for f in file_list)
+    keyboard.append([InlineKeyboardButton("🗑️ Clear All", callback_data="browser_clear_favs")])
     
     await message.reply_text(
-        f"📥 **Upload Mode Selection**\n\n"
-        f"Files: {len(file_list)}\n"
-        f"Size: {format_size(total_size)}\n\n"
-        f"Choose upload mode:",
+        f"⭐ **Your Favorites**\n\n"
+        f"You have {len(FAVORITES[user_id])} favorite folders",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-# ==================== CALLBACK HANDLERS ====================
-@app.on_callback_query()
-async def callback_handler(client, query):
-    """Handle all callback queries"""
+@app.on_message(filters.media & filters.user(OWNER_ID))
+async def handle_media(client, message: Message):
+    """Handle incoming media files"""
     try:
-        user_id = query.from_user.id
-        service = get_drive_service()
+        # Get file object and name
+        media_type = message.media.value
+        file_obj = getattr(message, media_type)
+        filename = getattr(file_obj, 'file_name', None)
+        caption = message.caption or ""  # Capture caption
         
+        if not filename:
+            # Generate filename for media without names
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            ext_map = {'photo': 'jpg', 'video': 'mp4', 'audio': 'mp3', 'voice': 'ogg', 'animation': 'gif'}
+            ext = ext_map.get(media_type, 'file')
+            filename = f"{media_type}_{timestamp}.{ext}"
+        
+        # Info object
+        file_info = {'msg_id': message.id, 'name': filename, 'caption': caption}
+
+        # Check if part of media group (album)
+        if message.media_group_id:
+            group_id = message.media_group_id
+            
+            if group_id not in ALBUMS:
+                ALBUMS[group_id] = []
+                
+                # Wait for all album files (2 second delay)
+                async def process_album():
+                    await asyncio.sleep(2)
+                    
+                    if group_id in ALBUMS:
+                        file_list = ALBUMS.pop(group_id)
+                        key = f"album_{group_id}"
+                        TEMP_FILES[key] = file_list
+                        
+                        # Check for ANY caption in the album
+                        detected_caption = next((f['caption'] for f in file_list if f['caption']), None)
+                        first_file = file_list[0]['name']
+                        cleaned_name = clean_series_name(first_file)
+                        
+                        buttons = []
+                        # 1. Series (Caption OR Auto) - Priority to Caption
+                        if detected_caption:
+                            buttons.append([InlineKeyboardButton(f"📂 Series: {detected_caption[:30]}...", callback_data=f"cap|{key}")])
+                        else:
+                            buttons.append([InlineKeyboardButton(f"📂 Series: {cleaned_name[:30]}...", callback_data=f"auto|{key}")])
+                        
+                        # 2. Standalone
+                        buttons.append([InlineKeyboardButton("📁 Standalone", callback_data=f"std|{key}")])
+                        # 3. Not an Audiobook
+                        buttons.append([InlineKeyboardButton("🚫 Not an Audiobook", callback_data=f"root|{key}")])
+                        # 4. Custom
+                        buttons.append([InlineKeyboardButton("✏️ Custom Series Name", callback_data=f"custom|{key}")])
+                        # 5. Cancel
+                        buttons.append([InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_selection|{key}")])
+
+                        txt = f"📦 **Album Detected**\n📚 Files: {len(file_list)}"
+                        if detected_caption: txt += f"\n🏷 **Caption:** `{detected_caption}`"
+                        await message.reply_text(txt, reply_markup=InlineKeyboardMarkup(buttons))
+                
+                asyncio.create_task(process_album())
+            
+            ALBUMS[group_id].append(file_info)
+        
+        else:
+            # Single file
+            key = f"single_{message.id}"
+            TEMP_FILES[key] = [file_info]
+            cleaned_name = clean_series_name(filename)
+            
+            buttons = []
+            # 1. Series (Caption OR Auto)
+            if caption:
+                buttons.append([InlineKeyboardButton(f"📂 Series: {caption[:30]}...", callback_data=f"cap|{key}")])
+            else:
+                buttons.append([InlineKeyboardButton(f"📂 Series: {cleaned_name[:30]}...", callback_data=f"auto|{key}")])
+            
+            # 2. Standalone
+            buttons.append([InlineKeyboardButton("📁 Standalone", callback_data=f"std|{key}")])
+            # 3. Custom Series Name
+            buttons.append([InlineKeyboardButton("✏️ Custom Series Name", callback_data=f"custom|{key}")])
+            # 4. Not an Audiobook
+            buttons.append([InlineKeyboardButton("🚫 Not an Audiobook", callback_data=f"root|{key}")])
+            # 5. Cancel
+            buttons.append([InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_selection|{key}")])
+            
+            txt = f"📄 **File Received**\n`{filename}`"
+            if caption: txt += f"\n🏷 **Caption:** `{caption}`"
+            await message.reply_text(txt, reply_markup=InlineKeyboardMarkup(buttons))
+    
+    except Exception as e:
+        logger.error(f"Error handling media: {e}")
+        await message.reply_text(f"❌ Error: {str(e)}")
+
+@app.on_callback_query()
+async def handle_callback(client, query):
+    """Handle button callbacks"""
+    try:
         # ==================== BROWSER CALLBACKS ====================
-        if query.data.startswith("browser_") or query.data.startswith("folder|") or query.data.startswith("file|"):
+        if query.data.startswith("browser_"):
+            user_id = query.from_user.id
+            service = get_drive_service()
             
             if not service:
-                await query.answer("❌ Drive connection failed", show_alert=True)
+                await query.answer("❌ Failed to connect to Drive", show_alert=True)
                 return
             
-            session = BROWSER_SESSIONS.get(user_id)
-            if not session and not query.data in ["browser_close", "browser_search", "browser_favorites", "browser_clear_favs"]:
-                await query.answer("⚠️ Session expired. Use /browse to start again.", show_alert=True)
-                return
+            session = get_browser_session(user_id)
             
-            # Close browser
-            if query.data == "browser_close":
-                try:
-                    await query.message.delete()
-                except:
-                    await query.message.edit_text("✅ Browser closed")
-                await query.answer()
-                return
-            
-            # Navigate to folder
-            if query.data.startswith("folder|"):
-                folder_id = query.data.replace("folder|", "")
+            # Open folder
+            if query.data.startswith("browser_open|"):
+                folder_id = query.data.replace("browser_open|", "")
                 
                 # Get folder info
+                folder_info = get_folder_info(service, folder_id)
+                if not folder_info:
+                    await query.answer("❌ Folder not found", show_alert=True)
+                    return
+                
+                # Update session
+                session['current_folder'] = folder_id
+                session['path'].append({'name': folder_info['name'], 'id': folder_id})
+                session['page'] = 0
+                session['selected_files'] = []
+                
+                # List files in folder
+                folders, files, _ = list_drive_files(service, folder_id)
+                total_items = len(folders) + len(files)
+                
+                if total_items == 0:
+                    await query.answer("📁 Folder is empty", show_alert=True)
+                    # Go back
+                    session['path'].pop()
+                    if session['path']:
+                        session['current_folder'] = session['path'][-1]['id']
+                    return
+                
+                # Build keyboard
+                keyboard = build_browser_keyboard(user_id, folders, files, total_items)
+                breadcrumb = get_breadcrumb(session)
+                
+                await query.message.edit_text(
+                    f"📁 **File Browser**\n"
+                    f"📍 {breadcrumb}\n"
+                    f"📊 {len(folders)} folders, {len(files)} files",
+                    reply_markup=keyboard
+                )
+                await query.answer()
+            
+            # Select/Deselect file
+            elif query.data.startswith("browser_select|"):
+                file_id = query.data.replace("browser_select|", "")
+                
+                if file_id in session['selected_files']:
+                    session['selected_files'].remove(file_id)
+                    await query.answer("✅ Deselected", show_alert=False)
+                else:
+                    session['selected_files'].append(file_id)
+                    await query.answer("✅ Selected", show_alert=False)
+                
+                # Refresh display
+                folders, files, _ = list_drive_files(service, session['current_folder'])
+                total_items = len(folders) + len(files)
+                keyboard = build_browser_keyboard(user_id, folders, files, total_items)
+                breadcrumb = get_breadcrumb(session)
+                
+                await query.message.edit_text(
+                    f"📁 **File Browser**\n"
+                    f"📍 {breadcrumb}\n"
+                    f"📊 {len(folders)} folders, {len(files)} files\n"
+                    f"✅ Selected: {len(session['selected_files'])}",
+                    reply_markup=keyboard
+                )
+            
+            # File info
+            elif query.data.startswith("browser_info|"):
+                file_id = query.data.replace("browser_info|", "")
+                
                 try:
-                    folder = service.files().get(
-                        fileId=folder_id,
-                        fields="id, name",
-                        supportsAllDrives=True
+                    file_info = service.files().get(
+                        fileId=file_id,
+                        fields="id, name, mimeType, size, modifiedTime, createdTime"
                     ).execute()
                     
-                    # Update session
-                    session['path'].append({'id': session['current_folder'], 'name': folder['name']})
-                    session['current_folder'] = folder_id
-                    session['page'] = 0
+                    name = file_info['name']
+                    size = format_size(int(file_info.get('size', 0))) if 'size' in file_info else 'N/A'
+                    modified = file_info.get('modifiedTime', 'N/A')[:10]
+                    created = file_info.get('createdTime', 'N/A')[:10]
                     
-                    # List new folder contents
-                    folders, files, _ = list_drive_files(service, folder_id)
-                    total_items = len(folders) + len(files)
-                    keyboard = build_browser_keyboard(user_id, folders, files, total_items)
-                    breadcrumb = get_breadcrumb(session)
-                    
-                    # FIXED: Check if content actually changed before editing
-                    new_text = (
-                        f"📁 **File Browser**\n"
-                        f"📍 {breadcrumb}\n"
-                        f"📊 {len(folders)} folders, {len(files)} files"
+                    info_text = (
+                        f"📄 **File Info**\n\n"
+                        f"**Name:** `{name}`\n"
+                        f"**Size:** {size}\n"
+                        f"**Modified:** {modified}\n"
+                        f"**Created:** {created}\n"
                     )
                     
-                    try:
-                        await query.message.edit_text(new_text, reply_markup=keyboard)
-                    except MessageNotModified:
-                        # Content is the same, just answer the callback
-                        pass
-                    
-                    await query.answer()
-                    
+                    await query.answer(info_text, show_alert=True)
                 except Exception as e:
-                    await query.answer(f"❌ Error: {str(e)}", show_alert=True)
+                    await query.answer(f"❌ Error: {str(e)[:100]}", show_alert=True)
+            
+            # Download selected
+            elif query.data == "browser_download":
+                if not session['selected_files']:
+                    await query.answer("❌ No files selected", show_alert=True)
+                    return
                 
-                return
+                file_count = len(session['selected_files'])
+                await query.message.edit_text(f"📥 **Starting download...**\n\n📦 Files: {file_count}")
+                
+                # Start download task
+                asyncio.create_task(download_from_drive_task(
+                    client, 
+                    query.message, 
+                    session['selected_files'].copy(), 
+                    service
+                ))
+                
+                # Clear selection
+                session['selected_files'] = []
+                await query.answer(f"📥 Downloading {file_count} files...", show_alert=False)
             
-            # File selection
-            if query.data.startswith("file|"):
-                file_id = query.data.replace("file|", "")
-                await query.answer("📄 File options coming soon!", show_alert=True)
-                return
+            # Clear selection
+            elif query.data == "browser_clear":
+                session['selected_files'] = []
+                
+                # Refresh display
+                folders, files, _ = list_drive_files(service, session['current_folder'])
+                total_items = len(folders) + len(files)
+                keyboard = build_browser_keyboard(user_id, folders, files, total_items)
+                breadcrumb = get_breadcrumb(session)
+                
+                await query.message.edit_text(
+                    f"📁 **File Browser**\n"
+                    f"📍 {breadcrumb}\n"
+                    f"📊 {len(folders)} folders, {len(files)} files",
+                    reply_markup=keyboard
+                )
+                await query.answer("✅ Selection cleared", show_alert=False)
             
-            # Back navigation
-            if query.data == "browser_back":
-                if session['path']:
-                    prev = session['path'].pop()
-                    session['current_folder'] = prev['id']
+            # Back button
+            elif query.data == "browser_back":
+                if len(session['path']) > 1:
+                    session['path'].pop()
+                    session['current_folder'] = session['path'][-1]['id']
                     session['page'] = 0
+                    session['selected_files'] = []
                     
+                    # List files
                     folders, files, _ = list_drive_files(service, session['current_folder'])
                     total_items = len(folders) + len(files)
                     keyboard = build_browser_keyboard(user_id, folders, files, total_items)
                     breadcrumb = get_breadcrumb(session)
                     
-                    new_text = (
-                        f"📁 **File Browser**\n"
-                        f"📍 {breadcrumb}\n"
-                        f"📊 {len(folders)} folders, {len(files)} files"
-                    )
-                    
                     try:
-                        await query.message.edit_text(new_text, reply_markup=keyboard)
+                        await query.message.edit_text(
+                            f"📁 **File Browser**\n"
+                            f"📍 {breadcrumb}\n"
+                            f"📊 {len(folders)} folders, {len(files)} files",
+                            reply_markup=keyboard
+                        )
                     except MessageNotModified:
                         pass
-                    
-                    await query.answer()
-                else:
-                    await query.answer("Already at root", show_alert=False)
+                await query.answer()
+            
+            # Home button
+            elif query.data == "browser_home":
+                session['current_folder'] = DRIVE_FOLDER_ID
+                session['path'] = [{'name': 'My Drive', 'id': DRIVE_FOLDER_ID}]
+                session['page'] = 0
+                session['selected_files'] = []
                 
-                return
+                # List files
+                folders, files, _ = list_drive_files(service, DRIVE_FOLDER_ID)
+                total_items = len(folders) + len(files)
+                keyboard = build_browser_keyboard(user_id, folders, files, total_items)
+                breadcrumb = get_breadcrumb(session)
+                
+                try:
+                    await query.message.edit_text(
+                        f"📁 **File Browser**\n"
+                        f"📍 {breadcrumb}\n"
+                        f"📊 {len(folders)} folders, {len(files)} files",
+                        reply_markup=keyboard
+                    )
+                except MessageNotModified:
+                    pass
+                await query.answer()
             
             # Pagination
-            if query.data == "browser_prev":
+            elif query.data == "browser_prev":
                 session['page'] = max(0, session['page'] - 1)
                 
                 folders, files, _ = list_drive_files(service, session['current_folder'])
@@ -949,21 +1782,18 @@ async def callback_handler(client, query):
                 keyboard = build_browser_keyboard(user_id, folders, files, total_items)
                 breadcrumb = get_breadcrumb(session)
                 
-                new_text = (
-                    f"📁 **File Browser**\n"
-                    f"📍 {breadcrumb}\n"
-                    f"📊 {len(folders)} folders, {len(files)} files"
-                )
-                
                 try:
-                    await query.message.edit_text(new_text, reply_markup=keyboard)
+                    await query.message.edit_text(
+                        f"📁 **File Browser**\n"
+                        f"📍 {breadcrumb}\n"
+                        f"📊 {len(folders)} folders, {len(files)} files",
+                        reply_markup=keyboard
+                    )
                 except MessageNotModified:
                     pass
-                
                 await query.answer()
-                return
             
-            if query.data == "browser_next":
+            elif query.data == "browser_next":
                 folders, files, _ = list_drive_files(service, session['current_folder'])
                 total_items = len(folders) + len(files)
                 max_page = (total_items - 1) // ITEMS_PER_PAGE
@@ -973,58 +1803,45 @@ async def callback_handler(client, query):
                 keyboard = build_browser_keyboard(user_id, folders, files, total_items)
                 breadcrumb = get_breadcrumb(session)
                 
-                new_text = (
-                    f"📁 **File Browser**\n"
-                    f"📍 {breadcrumb}\n"
-                    f"📊 {len(folders)} folders, {len(files)} files"
-                )
-                
                 try:
-                    await query.message.edit_text(new_text, reply_markup=keyboard)
+                    await query.message.edit_text(
+                        f"📁 **File Browser**\n"
+                        f"📍 {breadcrumb}\n"
+                        f"📊 {len(folders)} folders, {len(files)} files",
+                        reply_markup=keyboard
+                    )
                 except MessageNotModified:
                     pass
-                
                 await query.answer()
-                return
-            
-            # No-op for page indicator
-            if query.data == "browser_noop":
-                await query.answer()
-                return
             
             # Refresh
-            if query.data == "browser_refresh":
+            elif query.data == "browser_refresh":
                 folders, files, _ = list_drive_files(service, session['current_folder'])
                 total_items = len(folders) + len(files)
                 keyboard = build_browser_keyboard(user_id, folders, files, total_items)
                 breadcrumb = get_breadcrumb(session)
                 
-                new_text = (
-                    f"📁 **File Browser**\n"
-                    f"📍 {breadcrumb}\n"
-                    f"📊 {len(folders)} folders, {len(files)} files"
-                )
-                
                 try:
-                    await query.message.edit_text(new_text, reply_markup=keyboard)
+                    await query.message.edit_text(
+                        f"📁 **File Browser**\n"
+                        f"📍 {breadcrumb}\n"
+                        f"📊 {len(folders)} folders, {len(files)} files",
+                        reply_markup=keyboard
+                    )
                 except MessageNotModified:
                     pass
-                
                 await query.answer("🔄 Refreshed", show_alert=False)
-                return
             
             # Search button
-            if query.data == "browser_search":
+            elif query.data == "browser_search":
                 await query.answer("🔍 Use /search <query> command", show_alert=True)
-                return
             
             # Favorites button
-            if query.data == "browser_favorites":
+            elif query.data == "browser_favorites":
                 await query.answer("⭐ Use /favorites command", show_alert=True)
-                return
             
             # Clear favorites
-            if query.data == "browser_clear_favs":
+            elif query.data == "browser_clear_favs":
                 if user_id in FAVORITES:
                     count = len(FAVORITES[user_id])
                     FAVORITES[user_id] = []
@@ -1032,40 +1849,47 @@ async def callback_handler(client, query):
                     await query.message.edit_text("⭐ **Favorites cleared!**")
                 else:
                     await query.answer("ℹ️ No favorites to clear", show_alert=True)
-                return
+            
+            return
         
         # ==================== UPLOAD CALLBACKS ====================
-        # Cancel selection
+        # Check for cancel selection button (before upload starts)
         if query.data.startswith("cancel_selection|"):
             key = query.data.replace("cancel_selection|", "")
             
+            # Remove from temp files
             if key in TEMP_FILES:
                 file_count = len(TEMP_FILES[key])
                 del TEMP_FILES[key]
+                logger.info(f"User cancelled selection for key: {key}")
                 
                 await query.answer("✅ Cancelled", show_alert=False)
                 await query.message.edit_text(
                     f"❌ **Upload Cancelled**\n\n"
-                    f"{file_count} file(s) discarded."
+                    f"{file_count} file(s) discarded.\n"
+                    f"Send new files to upload again."
                 )
             else:
                 await query.answer("ℹ️ Already processed", show_alert=True)
             return
         
-        # Cancel upload
+        # Check for cancel button (during upload)
         if query.data.startswith("cancel_"):
             task_id = query.data.replace("cancel_", "")
             
             if task_id in ACTIVE_TASKS:
                 ACTIVE_TASKS[task_id]['cancelled'] = True
+                logger.info(f"Cancelling task via button: {task_id}")
                 
-                await query.answer("🛑 Cancelling...", show_alert=True)
-                await query.message.edit_text("🛑 **Cancellation Requested**\n\nPlease wait...")
+                await query.answer("🛑 Cancellation requested...", show_alert=True)
+                await query.message.edit_text(
+                    f"🛑 **Cancellation Requested**\n\n"
+                    f"Please wait for the task to stop..."
+                )
             else:
                 await query.answer("ℹ️ Task already completed", show_alert=True)
             return
         
-        # Upload mode selection
         data_parts = query.data.split('|')
         mode = data_parts[0]
         key = data_parts[1] if len(data_parts) > 1 else None
@@ -1077,54 +1901,56 @@ async def callback_handler(client, query):
         file_list = TEMP_FILES[key]
         
         if mode == "std":
+            # Standalone mode - each file in its own folder
             queue_id = add_to_queue(file_list, series_name=None, flat_upload=False)
             await query.message.edit_text(f"🚀 Starting upload...\n📋 Queue ID: `{queue_id}`")
             asyncio.create_task(upload_task(client, query.message, file_list, series_name=None, queue_id=queue_id))
             del TEMP_FILES[key]
         
         elif mode == "root":
+            # Not an Audiobook - Upload directly to Root (No folders)
             queue_id = add_to_queue(file_list, series_name=None, flat_upload=True)
-            await query.message.edit_text(f"🚀 Uploading to Root...\n📋 Queue ID: `{queue_id}`")
+            await query.message.edit_text(f"🚀 Uploading directly to Root...\n📋 Queue ID: `{queue_id}`")
             asyncio.create_task(upload_task(client, query.message, file_list, series_name=None, flat_upload=True, queue_id=queue_id))
             del TEMP_FILES[key]
-        
+
         elif mode == "cap":
+            # Use detected caption
             series_name = next((f['caption'] for f in file_list if f['caption']), "Unknown Series")
             queue_id = add_to_queue(file_list, series_name=series_name, flat_upload=False)
-            await query.message.edit_text(f"🚀 Series: **{series_name}**\n📋 Queue ID: `{queue_id}`")
+            await query.message.edit_text(f"🚀 Series Upload: **{series_name}**\n📋 Queue ID: `{queue_id}`")
             asyncio.create_task(upload_task(client, query.message, file_list, series_name=series_name, queue_id=queue_id))
             del TEMP_FILES[key]
         
         elif mode == "auto":
+            # Auto-detected series name from filename
             first_file = file_list[0]['name']
             series_name = clean_series_name(first_file)
             queue_id = add_to_queue(file_list, series_name=series_name, flat_upload=False)
-            await query.message.edit_text(f"🚀 Series: **{series_name}**\n📋 Queue ID: `{queue_id}`")
+            await query.message.edit_text(f"🚀 Series Upload: **{series_name}**\n📋 Queue ID: `{queue_id}`")
             asyncio.create_task(upload_task(client, query.message, file_list, series_name=series_name, queue_id=queue_id))
             del TEMP_FILES[key]
         
         elif mode == "custom":
-            ACTIVE_SERIES[user_id] = {
+            # Ask for custom series name
+            ACTIVE_SERIES[query.from_user.id] = {
                 'file_list': file_list,
                 'key': key
             }
             await query.message.edit_text(
-                "✏️ **Enter Custom Series Name**\n\n"
+                " ` Enter Custom Series Name `\n\n"
                 "Reply with the series name you want to use."
             )
         
         await query.answer()
     
-    except MessageNotModified:
-        # Silently ignore - message content is the same
-        await query.answer()
     except Exception as e:
         logger.error(f"Callback error: {e}")
         await query.answer(f"Error: {str(e)}", show_alert=True)
 
-@app.on_message(filters.text & filters.user(OWNER_ID) & ~filters.command(["start", "stats", "browse", "search", "queue", "favorites"]))
+@app.on_message(filters.text & filters.user(OWNER_ID) & ~filters.command(["start", "stats", "cancel", "queue", "status", "retry", "clearfailed"]))
 async def handle_text(client, message: Message):
-    """Handle text messages (custom series names)"""
+    """Handle text messages (series names)"""
     user_id = message.from_user.id
     
     if user_id in ACTIVE_SERIES:
@@ -1139,7 +1965,7 @@ async def handle_text(client, message: Message):
             del TEMP_FILES[key]
         
         queue_id = add_to_queue(file_list, series_name=series_name, flat_upload=False)
-        status = await message.reply_text(f"🚀 Series: **{series_name}**\n📋 Queue ID: `{queue_id}`")
+        status = await message.reply_text(f"🚀 Starting series upload: **{series_name}**\n📋 Queue ID: `{queue_id}`")
         asyncio.create_task(upload_task(client, status, file_list, series_name=series_name, queue_id=queue_id))
 
 # ==================== MAIN ====================
@@ -1149,16 +1975,17 @@ if __name__ == "__main__":
     # Create downloads directory
     os.makedirs("downloads", exist_ok=True)
     
-    # Load stats
+    # Load stats from Drive
     try:
         service = get_drive_service()
         if service:
             sync_stats(service, save=False)
     except Exception as e:
-        logger.error(f"Failed to load stats: {e}")
+        logger.error(f"Failed to load initial stats: {e}")
     
-    logger.info("✅ Bot initialized!")
+    logger.info("✅ Bot initialized successfully!")
     logger.info(f"👤 Owner ID: {OWNER_ID}")
     logger.info(f"📁 Drive Folder: {DRIVE_FOLDER_ID}")
     
+    # Run bot
     app.run()
