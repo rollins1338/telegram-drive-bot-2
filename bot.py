@@ -1190,14 +1190,16 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
                             p = progress_data['last_progress']
                             try:
                                 await status_msg.edit_text(
-                                    f"☁️ **Uploading to Drive ({idx}/{len(file_list)}){retry_text}**\n"
+                                    f"☁️ **Uploading to Drive**{retry_text}\n"
+                                    f"━━━━━━━━━━━━━━━\n"
                                     f"📄 `{p['filename'][:40]}...`\n\n"
                                     f"[{p['bar']}] {p['progress']}%\n"
                                     f"⚡ Speed: {p['speed']/1024/1024:.2f} MB/s\n"
                                     f"💾 {p['current']/1024/1024:.1f} MB / {p['total']/1024/1024:.1f} MB\n"
                                     f"⏱️ ETA: {p['eta']}\n\n"
-                                    f"✅ {successful_uploads} | ❌ {len(failed_uploads)}\n"
-                                    f"📊 Overall: {int((idx-1)/len(file_list)*100)}%"
+                                    f"━━━━━━━━━━━━━━━\n"
+                                    f"📊 File: {idx}/{len(file_list)} | Overall: {int((idx-1)/len(file_list)*100)}%\n"
+                                    f"✅ Success: {successful_uploads} | ❌ Failed: {len(failed_uploads)}"
                                 )
                             except:
                                 pass
@@ -1279,22 +1281,32 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
         elapsed_time = time.time() - start_time
         location_text = "Root (No Folders)" if flat_upload else (f"**{series_name}**" if series_name else "Root -> Standalone")
         
-        status_text = f"✅ **Upload Complete!**\n\n"
-        status_text += f"📁 Location: {location_text}\n"
-        status_text += f"✅ Successful: {successful_uploads}/{len(file_list)}\n"
-        status_text += f"📊 Total Size: {format_size(total_size_uploaded)}\n"
-        status_text += f"⏱️ Time: {format_time(elapsed_time)}\n"
+        status_text = (
+            f"✅ **Upload Complete!**\n"
+            f"━━━━━━━━━━━━━━━\n\n"
+            f"📁 Location: {location_text}\n"
+            f"✅ Successful: {successful_uploads}/{len(file_list)}\n"
+            f"📊 Total Size: {format_size(total_size_uploaded)}\n"
+            f"⏱️ Time: {format_time(elapsed_time)}\n"
+        )
         
         if elapsed_time > 0:
             status_text += f"⚡ Avg Speed: {format_size(total_size_uploaded/elapsed_time)}/s\n"
         
         if failed_uploads:
-            status_text += f"\n❌ **Failed: {len(failed_uploads)}**\n"
-            status_text += f"Use `/retry` to retry failed uploads\n\n**Errors:**\n"
+            status_text += (
+                f"\n❌ **Failed: {len(failed_uploads)}**\n"
+                f"Use `/retry` to retry failed uploads\n\n"
+                f"**Errors:**\n"
+            )
             for error in failed_uploads[:5]:  # Show first 5 errors
                 status_text += f"• {error}\n"
         
-        status_text += f"\n📈 **Total Stats:** {TOTAL_FILES} files | {TOTAL_BYTES/1024/1024/1024:.2f} GB"
+        status_text += (
+            f"\n━━━━━━━━━━━━━━━\n"
+            f"📈 **Total Stats**\n"
+            f"📁 Files: {TOTAL_FILES:,} | 💾 Size: {TOTAL_BYTES/1024/1024/1024:.2f} GB"
+        )
         
         await status_msg.edit_text(status_text)
         
@@ -1316,25 +1328,31 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
 @app.on_message(filters.command("start") & filters.user(OWNER_ID))
 async def start_command(client, message):
     """Welcome message"""
+    uptime = format_time(time.time() - START_TIME)
+    
     await message.reply_text(
-        "🤖 **Hi, I'm RxUploader**\n\n"
-        "**📤 UPLOAD TO DRIVE**\n"
-        "Send me files → I upload to Google Drive\n"
-        "• Series auto-detection\n"
-        "• Queue management\n"
-        "• Progress tracking\n\n"
-        "**📥 DOWNLOAD FROM DRIVE**\n"
-        "Send me a Drive link → I send you the file\n"
+        "🤖 **RxUploader Bot**\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        "**📤 Upload to Drive**\n"
+        "Send files → Auto-upload to Google Drive\n"
+        "• Series auto-detection ✅\n"
+        "• Queue management ✅\n"
+        "• Real-time progress ✅\n\n"
+        "**📥 Download from Drive**\n"
+        "Send Drive link → Get files instantly\n"
         "• Single files ✅\n"
         "• Entire folders ✅\n\n"
-        "**Commands:**\n"
-        "/stats - Statistics\n"
-        "/queue - Upload queue\n"
-        "/browse - Browse Drive (old way)\n"
-        "/search <query> - Search Drive\n\n"
-        "**Examples:**\n"
-        "📤 Upload: Send a file\n"
-        "📥 Download: Send `https://drive.google.com/file/d/...`"
+        "**⚙️ Commands**\n"
+        "/stats - View statistics\n"
+        "/queue - Check upload queue\n"
+        "/browse - Browse your Drive\n"
+        "/search <query> - Search files\n"
+        "/cancel - Cancel uploads\n"
+        "/retry - Retry failed uploads\n\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"⏱️ Uptime: {uptime}\n"
+        f"📊 Uploaded: {TOTAL_FILES:,} files\n"
+        f"💾 Total: {TOTAL_BYTES/1024/1024/1024:.2f} GB"
     )
 
 @app.on_message(filters.command("stats") & filters.user(OWNER_ID))
@@ -1343,18 +1361,19 @@ async def stats_command(client, message):
     uptime = str(datetime.timedelta(seconds=int(time.time() - START_TIME)))
     
     stats_text = (
-        f"📊 **Bot Statistics**\n\n"
-        f"⏱️ **Uptime:** `{uptime}`\n"
-        f"📁 **Total Files:** `{TOTAL_FILES:,}`\n"
-        f"💾 **Total Data:** `{TOTAL_BYTES/1024/1024/1024:.2f} GB`\n"
+        f"📊 **Bot Statistics**\n"
+        f"━━━━━━━━━━━━━━━\n\n"
+        f"⏱️ Uptime: `{uptime}`\n"
+        f"📁 Total Files: `{TOTAL_FILES:,}`\n"
+        f"💾 Total Data: `{TOTAL_BYTES/1024/1024/1024:.2f} GB`\n"
     )
     
     if TOTAL_FILES > 0:
-        stats_text += f"📈 **Average File Size:** `{(TOTAL_BYTES/TOTAL_FILES/1024/1024):.2f} MB`"
+        stats_text += f"📈 Avg File: `{(TOTAL_BYTES/TOTAL_FILES/1024/1024):.2f} MB`"
     
     # Show active tasks
     if ACTIVE_TASKS:
-        stats_text += f"\n\n🔄 **Active Tasks:** {len(ACTIVE_TASKS)}"
+        stats_text += f"\n\n━━━━━━━━━━━━━━━\n🔄 **Active Tasks:** {len(ACTIVE_TASKS)}"
     
     await message.reply_text(stats_text)
 
@@ -1398,7 +1417,10 @@ async def queue_command(client, message):
 @app.on_message(filters.command("status") & filters.user(OWNER_ID))
 async def status_command(client, message):
     """Show detailed status of all operations"""
-    status_text = "📊 **Bot Status**\n\n"
+    status_text = (
+        "📊 **Bot Status**\n"
+        "━━━━━━━━━━━━━━━\n\n"
+    )
     
     # Active tasks
     if ACTIVE_TASKS:
@@ -1409,17 +1431,17 @@ async def status_command(client, message):
             status = task_data.get('status', 'unknown')
             files_count = len(task_data.get('files_list', []))
             
-            status_text += f"📌 Task: `{task_id[:25]}...`\n"
-            status_text += f"  📄 Current: {current_file[:35]}...\n"
-            status_text += f"  📊 Progress: {progress}%\n"
-            status_text += f"  📁 Total Files: {files_count}\n"
-            status_text += f"  🔧 Status: {status}\n\n"
+            status_text += f"📌 `{task_id[:25]}...`\n"
+            status_text += f"  📄 {current_file[:35]}...\n"
+            status_text += f"  📊 {progress}% • {status}\n"
+            status_text += f"  📁 {files_count} files total\n\n"
     else:
         status_text += "✅ No active uploads\n\n"
     
     # Queue status
+    status_text += "━━━━━━━━━━━━━━━\n"
     if UPLOAD_QUEUE:
-        status_text += f"📋 **Queued Tasks:** {len(UPLOAD_QUEUE)}\n"
+        status_text += f"📋 **Queued:** {len(UPLOAD_QUEUE)}\n"
         for queue_id, data in list(UPLOAD_QUEUE.items())[:5]:  # Show first 5
             status_text += f"  • {queue_id}: {len(data['files'])} files ({data['status']})\n"
     else:
@@ -1427,13 +1449,21 @@ async def status_command(client, message):
     
     # Failed uploads
     if FAILED_UPLOADS:
-        status_text += f"\n❌ **Failed Uploads:** {len(FAILED_UPLOADS)} tasks\n"
+        status_text += (
+            f"\n━━━━━━━━━━━━━━━\n"
+            f"❌ **Failed:** {len(FAILED_UPLOADS)} tasks\n"
+        )
         total_failed = sum(len(data['files']) for data in FAILED_UPLOADS.values())
-        status_text += f"  Total failed files: {total_failed}\n"
-        status_text += f"  Use `/retry` to retry\n"
+        status_text += f"  📊 {total_failed} files failed\n"
+        status_text += f"  💡 Use `/retry` to retry\n"
     
     # System stats
     uptime = str(datetime.timedelta(seconds=int(time.time() - START_TIME)))
+    status_text += (
+        f"\n━━━━━━━━━━━━━━━\n"
+        f"⏱️ Uptime: {uptime}\n"
+        f"📈 Total: {TOTAL_FILES:,} files ({TOTAL_BYTES/1024/1024/1024:.2f} GB)"
+    )
     status_text += f"\n⏱️ **Uptime:** {uptime}\n"
     status_text += f"📈 **Total Uploaded:** {TOTAL_FILES} files ({TOTAL_BYTES/1024/1024/1024:.2f} GB)"
     
@@ -1512,9 +1542,10 @@ async def browse_command(client, message):
         breadcrumb = get_breadcrumb(session)
         
         await message.reply_text(
-            f"📁 **File Browser**\n"
+            f"📂 **Drive Browser**\n"
+            f"━━━━━━━━━━━━━━━\n"
             f"📍 {breadcrumb}\n"
-            f"📊 {len(folders)} folders, {len(files)} files",
+            f"📊 {len(folders)} folders • {len(files)} files",
             reply_markup=keyboard
         )
     
@@ -1558,8 +1589,9 @@ async def search_command(client, message):
         
         await status.edit_text(
             f"🔍 **Search Results**\n"
+            f"━━━━━━━━━━━━━━━\n"
             f"Query: `{query}`\n"
-            f"📊 Found {len(folders)} folders, {len(files)} files",
+            f"📊 {len(folders)} folders • {len(files)} files",
             reply_markup=keyboard
         )
     
@@ -2147,7 +2179,7 @@ async def handle_text(client, message: Message):
                     try:
                         if local_path.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm')):
                             await message.reply_video(local_path, caption=caption)
-                        elif local_path.lower().endswith(('.mp3', '.m4a', '.flac', '.wav', '.ogg')):
+                        elif local_path.lower().endswith(('.mp3', '.m4a', '.m4b', '.flac', '.wav', '.ogg', '.aac', '.opus')):
                             await message.reply_audio(local_path, caption=caption)
                         elif local_path.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
                             await message.reply_photo(local_path, caption=caption)
@@ -2209,7 +2241,7 @@ async def handle_text(client, message: Message):
                 
                 if local_path.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm')):
                     await message.reply_video(local_path, caption=caption)
-                elif local_path.lower().endswith(('.mp3', '.m4a', '.flac', '.wav', '.ogg')):
+                elif local_path.lower().endswith(('.mp3', '.m4a', '.m4b', '.flac', '.wav', '.ogg', '.aac', '.opus')):
                     await message.reply_audio(local_path, caption=caption)
                 elif local_path.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
                     await message.reply_photo(local_path, caption=caption)
