@@ -51,8 +51,7 @@ logger.info("🏥 Health check server starting on port 8000")
 API_ID = int(os.getenv('API_ID', '0'))
 API_HASH = os.getenv('API_HASH', '')
 BOT_TOKEN = os.getenv('TELEGRAM_TOKEN', '')
-DRIVE_FOLDER_ID = os.getenv('DRIVE_FOLDER_ID', '')  # For uploads
-BROWSE_FOLDER_ID = os.getenv('BROWSE_FOLDER_ID', 'root')  # For browsing - defaults to root
+DRIVE_FOLDER_ID = os.getenv('DRIVE_FOLDER_ID', '')
 OWNER_ID = int(os.getenv('OWNER_ID', '0'))
 TOKEN_JSON = os.getenv('TOKEN_JSON', '')
 
@@ -62,9 +61,6 @@ if not all([API_ID, API_HASH, BOT_TOKEN, DRIVE_FOLDER_ID, OWNER_ID, TOKEN_JSON])
     logger.error(f"API_ID: {bool(API_ID)}, API_HASH: {bool(API_HASH)}, BOT_TOKEN: {bool(BOT_TOKEN)}")
     logger.error(f"DRIVE_FOLDER_ID: {bool(DRIVE_FOLDER_ID)}, OWNER_ID: {bool(OWNER_ID)}, TOKEN_JSON: {bool(TOKEN_JSON)}")
     exit(1)
-
-logger.info(f"📁 Upload folder: {DRIVE_FOLDER_ID}")
-logger.info(f"📂 Browse folder: {BROWSE_FOLDER_ID}")
 
 # Global stats
 START_TIME = time.time()
@@ -383,11 +379,8 @@ def list_drive_files(service, folder_id, page_token=None):
 def get_folder_info(service, folder_id):
     """Get information about a folder"""
     try:
-        if folder_id == BROWSE_FOLDER_ID or folder_id == 'root':
-            return {'id': folder_id, 'name': 'My Drive', 'parents': []}
-        
         if folder_id == DRIVE_FOLDER_ID:
-            return {'id': DRIVE_FOLDER_ID, 'name': 'Upload Folder', 'parents': []}
+            return {'id': DRIVE_FOLDER_ID, 'name': 'My Drive', 'parents': []}
         
         file = service.files().get(
             fileId=folder_id,
@@ -431,8 +424,8 @@ def get_browser_session(user_id):
     """Get or create browser session for user"""
     if user_id not in BROWSER_SESSIONS:
         BROWSER_SESSIONS[user_id] = {
-            'current_folder': BROWSE_FOLDER_ID,
-            'path': [{'name': 'My Drive', 'id': BROWSE_FOLDER_ID}],
+            'current_folder': DRIVE_FOLDER_ID,
+            'path': [{'name': 'My Drive', 'id': DRIVE_FOLDER_ID}],
             'selected_files': [],
             'page': 0,
             'view_mode': 'browse'  # browse, search, favorites
@@ -1374,13 +1367,13 @@ async def browse_command(client, message):
         session = get_browser_session(user_id)
         
         # Reset to root
-        session['current_folder'] = BROWSE_FOLDER_ID
-        session['path'] = [{'name': 'My Drive', 'id': BROWSE_FOLDER_ID}]
+        session['current_folder'] = DRIVE_FOLDER_ID
+        session['path'] = [{'name': 'My Drive', 'id': DRIVE_FOLDER_ID}]
         session['selected_files'] = []
         session['page'] = 0
         
         # List files
-        folders, files, _ = list_drive_files(service, BROWSE_FOLDER_ID)
+        folders, files, _ = list_drive_files(service, DRIVE_FOLDER_ID)
         total_items = len(folders) + len(files)
         
         if total_items == 0:
@@ -1394,9 +1387,7 @@ async def browse_command(client, message):
         await message.reply_text(
             f"📁 **File Browser**\n"
             f"📍 {breadcrumb}\n"
-            f"📊 {len(folders)} folders, {len(files)} files\n\n"
-            f"💡 Browsing entire Drive\n"
-            f"📤 Uploads go to: Upload Folder",
+            f"📊 {len(folders)} folders, {len(files)} files",
             reply_markup=keyboard
         )
     
@@ -1744,13 +1735,13 @@ async def handle_callback(client, query):
             
             # Home button
             elif query.data == "browser_home":
-                session['current_folder'] = BROWSE_FOLDER_ID
-                session['path'] = [{'name': 'My Drive', 'id': BROWSE_FOLDER_ID}]
+                session['current_folder'] = DRIVE_FOLDER_ID
+                session['path'] = [{'name': 'My Drive', 'id': DRIVE_FOLDER_ID}]
                 session['page'] = 0
                 session['selected_files'] = []
                 
                 # List files
-                folders, files, _ = list_drive_files(service, BROWSE_FOLDER_ID)
+                folders, files, _ = list_drive_files(service, DRIVE_FOLDER_ID)
                 total_items = len(folders) + len(files)
                 keyboard = build_browser_keyboard(user_id, folders, files, total_items)
                 breadcrumb = get_breadcrumb(session)
