@@ -9,7 +9,7 @@ import re
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
-from pyrogram.errors import FloodWait, MessageNotModified
+from pyrogram.errors import FloodWait
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload, MediaIoBaseUpload
@@ -194,9 +194,7 @@ def get_or_create_folder(service, folder_name, parent_id):
         query = f'name="{clean_name}" and "{parent_id}" in parents and mimeType="application/vnd.google-apps.folder" and trashed=false'
         results = service.files().list(
             q=query,
-            fields="files(id, name)",
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True
+            fields="files(id, name)"
         ).execute()
         
         folders = results.get('files', [])
@@ -213,8 +211,7 @@ def get_or_create_folder(service, folder_name, parent_id):
         
         folder = service.files().create(
             body=file_metadata,
-            fields='id',
-            supportsAllDrives=True
+            fields='id'
         ).execute()
         
         logger.info(f"📁 Created new folder: {folder_name}")
@@ -285,6 +282,103 @@ def format_time(seconds):
         hours = int(seconds/3600)
         mins = int((seconds%3600)/60)
         return f"{hours}h {mins}m"
+
+# ==================== GOOGLE DRIVE DOWNLOAD FUNCTIONS ====================
+def extract_file_id_from_url(url):
+    """Extract Google Drive file ID from various URL formats"""
+    patterns = [
+        r'/file/d/([a-zA-Z0-9_-]+)',  # /file/d/FILE_ID
+        r'id=([a-zA-Z0-9_-]+)',        # ?id=FILE_ID
+        r'/folders/([a-zA-Z0-9_-]+)',  # /folders/FOLDER_ID
+        r'/d/([a-zA-Z0-9_-]+)',        # /d/FILE_ID
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    
+    return None
+
+def get_drive_file_metadata(service, file_id):
+    """Get file/folder metadata from Drive"""
+    try:
+        file = service.files().get(
+            fileId=file_id,
+            fields="id, name, mimeType, size, webViewLink",
+            supportsAllDrives=True
+        ).execute()
+        return file
+    except Exception as e:
+        logger.error(f"Error getting file metadata: {e}")
+        return None
+
+def list_folder_files_recursive(service, folder_id):
+    """List all files in a folder recursively"""
+    try:
+        all_files = []
+        page_token = None
+        
+        while True:
+            query = f"'{folder_id}' in parents and trashed=false"
+            results = service.files().list(
+                q=query,
+                pageSize=1000,
+                pageToken=page_token,
+                fields="nextPageToken, files(id, name, mimeType, size)",
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True
+            ).execute()
+            
+            items = results.get('files', [])
+            
+            for item in items:
+                if item['mimeType'] == 'application/vnd.google-apps.folder':
+                    # Recursively get files from subfolders
+                    subfolder_files = list_folder_files_recursive(service, item['id'])
+                    all_files.extend(subfolder_files)
+                else:
+                    all_files.append(item)
+            
+            page_token = results.get('nextPageToken')
+            if not page_token:
+                break
+        
+        return all_files
+    
+    except Exception as e:
+        logger.error(f"Error listing folder: {e}")
+        return []
+
+def download_file_from_drive(service, file_id, file_name):
+    """Download file from Google Drive to local storage"""
+    try:
+        request = service.files().get_media(
+            fileId=file_id,
+            supportsAllDrives=True
+        )
+        
+        download_path = f"downloads/{file_name}"
+        os.makedirs("downloads", exist_ok=True)
+        
+        fh = io.FileIO(download_path, 'wb')
+        downloader = MediaIoBaseDownload(fh, request, chunksize=10*1024*1024)
+        
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+            if status:
+                progress = int(status.progress() * 100)
+                if progress % 20 == 0:  # Log every 20%
+                    logger.info(f"Download {progress}% - {file_name}")
+        
+        fh.close()
+        logger.info(f"✅ Downloaded: {file_name}")
+        return download_path
+    
+    except Exception as e:
+        logger.error(f"Error downloading {file_name}: {e}")
+        return None
 
 def add_to_queue(file_list, series_name=None, flat_upload=False):
     """Add upload task to queue"""
@@ -358,33 +452,22 @@ def list_drive_files(service, folder_id, page_token=None):
     try:
         query = f"'{folder_id}' in parents and trashed=false"
         
-        all_items = []
-        next_page_token = page_token
+        results = service.files().list(
+            q=query,
+            pageSize=100,
+            pageToken=page_token,
+            fields="nextPageToken, files(id, name, mimeType, size, modifiedTime, parents)",
+            orderBy="folder,name"
+        ).execute()
         
-        # Fetch ALL pages, not just the first one
-        while True:
-            results = service.files().list(
-                q=query,
-                pageSize=1000,  # Increased from 100 to get more per page
-                pageToken=next_page_token,
-                fields="nextPageToken, files(id, name, mimeType, size, modifiedTime, parents)",
-                orderBy="folder,name",
-                supportsAllDrives=True,
-                includeItemsFromAllDrives=True
-            ).execute()
-            
-            items = results.get('files', [])
-            all_items.extend(items)
-            
-            next_page_token = results.get('nextPageToken')
-            if not next_page_token:
-                break  # No more pages
+        items = results.get('files', [])
+        next_page_token = results.get('nextPageToken')
         
         # Separate folders and files
-        folders = [item for item in all_items if item['mimeType'] == 'application/vnd.google-apps.folder']
-        files = [item for item in all_items if item['mimeType'] != 'application/vnd.google-apps.folder']
+        folders = [item for item in items if item['mimeType'] == 'application/vnd.google-apps.folder']
+        files = [item for item in items if item['mimeType'] != 'application/vnd.google-apps.folder']
         
-        return folders, files, None  # Return None for page_token since we fetched everything
+        return folders, files, next_page_token
     
     except Exception as e:
         logger.error(f"Error listing Drive files: {e}")
@@ -398,8 +481,7 @@ def get_folder_info(service, folder_id):
         
         file = service.files().get(
             fileId=folder_id,
-            fields="id, name, parents",
-            supportsAllDrives=True
+            fields="id, name, parents"
         ).execute()
         
         return file
@@ -420,9 +502,7 @@ def search_drive_files(service, query, folder_id=None):
             q=search_query,
             pageSize=50,
             fields="files(id, name, mimeType, size, modifiedTime, parents)",
-            orderBy="folder,name",
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True
+            orderBy="folder,name"
         ).execute()
         
         items = results.get('files', [])
@@ -586,8 +666,7 @@ async def download_from_drive_task(client, status_msg, file_ids, service):
                 # Get file metadata
                 file_metadata = service.files().get(
                     fileId=file_id,
-                    fields="id, name, mimeType, size",
-                    supportsAllDrives=True
+                    fields="id, name, mimeType, size"
                 ).execute()
                 
                 filename = file_metadata['name']
@@ -605,10 +684,7 @@ async def download_from_drive_task(client, status_msg, file_ids, service):
                 )
                 
                 # Download file from Drive
-                request = service.files().get_media(
-                    fileId=file_id,
-                    supportsAllDrives=True
-                )
+                request = service.files().get_media(fileId=file_id)
                 download_path = f"downloads/{filename}"
                 
                 os.makedirs("downloads", exist_ok=True)
@@ -720,8 +796,7 @@ def upload_to_drive_with_progress(service, file_path, file_metadata, message_dat
         request = service.files().create(
             body=file_metadata,
             media_body=media,
-            fields='id, size, webViewLink',
-            supportsAllDrives=True
+            fields='id, size, webViewLink'
         )
         
         response = None
@@ -1207,29 +1282,23 @@ async def start_command(client, message):
     """Welcome message"""
     await message.reply_text(
         "🤖 **Hi, I'm RxUploader**\n\n"
-        "📤 Send me files and I'll upload them to Rx's Google Drive!\n"
-        "📥 Or browse your Drive and download to Telegram!\n\n"
-        "**Upload Commands:**\n"
-        "/start - Wake me up!\n"
-        "/stats - View upload statistics\n"
-        "/status - Detailed status of all operations\n"
-        "/queue - View upload queue\n"
-        "/cancel - Cancel active upload/download\n"
-        "/retry - View and retry failed uploads\n"
-        "/clearfailed - Clear failed uploads history\n\n"
-        "**Download Commands:**\n"
-        "/browse - 📁 Browse Google Drive files\n"
-        "/search <query> - 🔍 Search Drive\n"
-        "/favorites - ⭐ Quick access favorites\n\n"
-        "**Features:**\n"
-        "• Multi support with auto-detection\n"
-        "• Series organization (auto or custom)\n"
+        "**📤 UPLOAD TO DRIVE**\n"
+        "Send me files → I upload to Google Drive\n"
+        "• Series auto-detection\n"
         "• Queue management\n"
-        "• Real-time progress tracking\n"
-        "• Auto-retry on errors (up to 3 attempts)\n"
-        "• File browser with multi-select\n"
-        "• Cancel anytime\n\n"
-        "Send me the next Audiobook or /browse to download!"
+        "• Progress tracking\n\n"
+        "**📥 DOWNLOAD FROM DRIVE**\n"
+        "Send me a Drive link → I send you the file\n"
+        "• Single files ✅\n"
+        "• Entire folders ✅\n\n"
+        "**Commands:**\n"
+        "/stats - Statistics\n"
+        "/queue - Upload queue\n"
+        "/browse - Browse Drive (old way)\n"
+        "/search <query> - Search Drive\n\n"
+        "**Examples:**\n"
+        "📤 Upload: Send a file\n"
+        "📥 Download: Send `https://drive.google.com/file/d/...`"
     )
 
 @app.on_message(filters.command("stats") & filters.user(OWNER_ID))
@@ -1747,15 +1816,12 @@ async def handle_callback(client, query):
                     keyboard = build_browser_keyboard(user_id, folders, files, total_items)
                     breadcrumb = get_breadcrumb(session)
                     
-                    try:
-                        await query.message.edit_text(
-                            f"📁 **File Browser**\n"
-                            f"📍 {breadcrumb}\n"
-                            f"📊 {len(folders)} folders, {len(files)} files",
-                            reply_markup=keyboard
-                        )
-                    except MessageNotModified:
-                        pass
+                    await query.message.edit_text(
+                        f"📁 **File Browser**\n"
+                        f"📍 {breadcrumb}\n"
+                        f"📊 {len(folders)} folders, {len(files)} files",
+                        reply_markup=keyboard
+                    )
                 await query.answer()
             
             # Home button
@@ -1771,15 +1837,12 @@ async def handle_callback(client, query):
                 keyboard = build_browser_keyboard(user_id, folders, files, total_items)
                 breadcrumb = get_breadcrumb(session)
                 
-                try:
-                    await query.message.edit_text(
-                        f"📁 **File Browser**\n"
-                        f"📍 {breadcrumb}\n"
-                        f"📊 {len(folders)} folders, {len(files)} files",
-                        reply_markup=keyboard
-                    )
-                except MessageNotModified:
-                    pass
+                await query.message.edit_text(
+                    f"📁 **File Browser**\n"
+                    f"📍 {breadcrumb}\n"
+                    f"📊 {len(folders)} folders, {len(files)} files",
+                    reply_markup=keyboard
+                )
                 await query.answer()
             
             # Pagination
@@ -1791,15 +1854,12 @@ async def handle_callback(client, query):
                 keyboard = build_browser_keyboard(user_id, folders, files, total_items)
                 breadcrumb = get_breadcrumb(session)
                 
-                try:
-                    await query.message.edit_text(
-                        f"📁 **File Browser**\n"
-                        f"📍 {breadcrumb}\n"
-                        f"📊 {len(folders)} folders, {len(files)} files",
-                        reply_markup=keyboard
-                    )
-                except MessageNotModified:
-                    pass
+                await query.message.edit_text(
+                    f"📁 **File Browser**\n"
+                    f"📍 {breadcrumb}\n"
+                    f"📊 {len(folders)} folders, {len(files)} files",
+                    reply_markup=keyboard
+                )
                 await query.answer()
             
             elif query.data == "browser_next":
@@ -1812,15 +1872,12 @@ async def handle_callback(client, query):
                 keyboard = build_browser_keyboard(user_id, folders, files, total_items)
                 breadcrumb = get_breadcrumb(session)
                 
-                try:
-                    await query.message.edit_text(
-                        f"📁 **File Browser**\n"
-                        f"📍 {breadcrumb}\n"
-                        f"📊 {len(folders)} folders, {len(files)} files",
-                        reply_markup=keyboard
-                    )
-                except MessageNotModified:
-                    pass
+                await query.message.edit_text(
+                    f"📁 **File Browser**\n"
+                    f"📍 {breadcrumb}\n"
+                    f"📊 {len(folders)} folders, {len(files)} files",
+                    reply_markup=keyboard
+                )
                 await query.answer()
             
             # Refresh
@@ -1830,15 +1887,12 @@ async def handle_callback(client, query):
                 keyboard = build_browser_keyboard(user_id, folders, files, total_items)
                 breadcrumb = get_breadcrumb(session)
                 
-                try:
-                    await query.message.edit_text(
-                        f"📁 **File Browser**\n"
-                        f"📍 {breadcrumb}\n"
-                        f"📊 {len(folders)} folders, {len(files)} files",
-                        reply_markup=keyboard
-                    )
-                except MessageNotModified:
-                    pass
+                await query.message.edit_text(
+                    f"📁 **File Browser**\n"
+                    f"📍 {breadcrumb}\n"
+                    f"📊 {len(folders)} folders, {len(files)} files",
+                    reply_markup=keyboard
+                )
                 await query.answer("🔄 Refreshed", show_alert=False)
             
             # Search button
@@ -1959,14 +2013,179 @@ async def handle_callback(client, query):
 
 @app.on_message(filters.text & filters.user(OWNER_ID) & ~filters.command(["start", "stats", "cancel", "queue", "status", "retry", "clearfailed"]))
 async def handle_text(client, message: Message):
-    """Handle text messages (series names)"""
+    """Handle text messages (Google Drive links or series names)"""
     user_id = message.from_user.id
+    text = message.text.strip()
     
+    # ==================== GOOGLE DRIVE LINK DETECTION ====================
+    if 'drive.google.com' in text:
+        # Handle Google Drive download
+        logger.info(f"Google Drive link detected from user {user_id}")
+        
+        # Extract file ID from URL
+        file_id = extract_file_id_from_url(text)
+        
+        if not file_id:
+            await message.reply_text("❌ Couldn't extract file ID from the link. Make sure it's a valid Google Drive link.")
+            return
+        
+        # Get Drive service
+        service = get_drive_service()
+        if not service:
+            await message.reply_text("❌ Failed to connect to Google Drive")
+            return
+        
+        # Get file/folder metadata
+        status_msg = await message.reply_text("🔍 Checking Drive link...")
+        
+        metadata = get_drive_file_metadata(service, file_id)
+        if not metadata:
+            await status_msg.edit_text("❌ Couldn't access this file. Make sure the bot has permission to view it.")
+            return
+        
+        file_name = metadata['name']
+        mime_type = metadata['mimeType']
+        
+        # Check if it's a folder
+        if mime_type == 'application/vnd.google-apps.folder':
+            await status_msg.edit_text(f"📁 **Folder Detected:** {file_name}\n\n🔍 Finding all files...")
+            
+            # Get all files in folder
+            files = list_folder_files_recursive(service, file_id)
+            
+            if not files:
+                await status_msg.edit_text(f"❌ No files found in folder: {file_name}")
+                return
+            
+            total_files = len(files)
+            await status_msg.edit_text(
+                f"📁 **Folder:** {file_name}\n"
+                f"📊 **Files found:** {total_files}\n\n"
+                f"⏳ Starting download..."
+            )
+            
+            # Download and send each file
+            successful = 0
+            failed = 0
+            
+            for idx, file_info in enumerate(files, 1):
+                try:
+                    # Update status every 5 files
+                    if idx % 5 == 0 or idx == 1:
+                        await status_msg.edit_text(
+                            f"📁 **Folder:** {file_name}\n"
+                            f"📊 Progress: {idx}/{total_files}\n"
+                            f"📄 Current: `{file_info['name'][:40]}...`\n"
+                            f"✅ Sent: {successful} | ❌ Failed: {failed}"
+                        )
+                    
+                    # Download from Drive
+                    local_path = download_file_from_drive(service, file_info['id'], file_info['name'])
+                    
+                    if not local_path:
+                        failed += 1
+                        continue
+                    
+                    # Send to Telegram based on file type
+                    file_size = int(file_info.get('size', 0))
+                    caption = f"📁 {file_name}\n📄 {file_info['name']}\n💾 {format_size(file_size)}"
+                    
+                    try:
+                        if local_path.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm')):
+                            await message.reply_video(local_path, caption=caption)
+                        elif local_path.lower().endswith(('.mp3', '.m4a', '.flac', '.wav', '.ogg')):
+                            await message.reply_audio(local_path, caption=caption)
+                        elif local_path.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
+                            await message.reply_photo(local_path, caption=caption)
+                        else:
+                            await message.reply_document(local_path, caption=caption)
+                        
+                        successful += 1
+                    except Exception as e:
+                        logger.error(f"Error sending {file_info['name']}: {e}")
+                        failed += 1
+                    
+                    # Clean up
+                    try:
+                        os.remove(local_path)
+                    except:
+                        pass
+                    
+                except FloodWait as e:
+                    logger.warning(f"FloodWait: {e.value} seconds")
+                    await asyncio.sleep(e.value)
+                except Exception as e:
+                    logger.error(f"Error processing {file_info['name']}: {e}")
+                    failed += 1
+            
+            # Final summary
+            await status_msg.edit_text(
+                f"✅ **Folder Complete:** {file_name}\n\n"
+                f"📊 Total: {total_files}\n"
+                f"✅ Sent: {successful}\n"
+                f"❌ Failed: {failed}"
+            )
+        
+        else:
+            # Single file download
+            file_size = metadata.get('size', 'Unknown')
+            
+            await status_msg.edit_text(
+                f"📄 **File:** {file_name}\n"
+                f"💾 **Size:** {format_size(file_size)}\n\n"
+                f"⏳ Downloading from Drive..."
+            )
+            
+            # Download from Drive
+            local_path = download_file_from_drive(service, file_id, file_name)
+            
+            if not local_path:
+                await status_msg.edit_text(f"❌ Failed to download: {file_name}")
+                return
+            
+            await status_msg.edit_text(
+                f"📄 **File:** {file_name}\n"
+                f"💾 **Size:** {format_size(file_size)}\n\n"
+                f"⏫ Uploading to Telegram..."
+            )
+            
+            try:
+                # Send to Telegram based on file type
+                caption = f"📄 {file_name}\n💾 {format_size(file_size)}"
+                
+                if local_path.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm')):
+                    await message.reply_video(local_path, caption=caption)
+                elif local_path.lower().endswith(('.mp3', '.m4a', '.flac', '.wav', '.ogg')):
+                    await message.reply_audio(local_path, caption=caption)
+                elif local_path.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
+                    await message.reply_photo(local_path, caption=caption)
+                else:
+                    await message.reply_document(local_path, caption=caption)
+                
+                await status_msg.edit_text(
+                    f"✅ **Sent:** {file_name}\n"
+                    f"💾 **Size:** {format_size(file_size)}"
+                )
+                
+            except Exception as e:
+                logger.error(f"Error sending file: {e}")
+                await status_msg.edit_text(f"❌ Failed to upload to Telegram: {str(e)}")
+            
+            finally:
+                # Clean up
+                try:
+                    os.remove(local_path)
+                except:
+                    pass
+        
+        return
+    
+    # ==================== SERIES NAME HANDLER (ORIGINAL UPLOAD LOGIC) ====================
     if user_id in ACTIVE_SERIES:
         series_data = ACTIVE_SERIES[user_id]
         file_list = series_data['file_list']
         key = series_data['key']
-        series_name = message.text.strip()
+        series_name = text
         
         # Clean up
         del ACTIVE_SERIES[user_id]
