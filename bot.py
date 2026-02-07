@@ -358,24 +358,33 @@ def list_drive_files(service, folder_id, page_token=None):
     try:
         query = f"'{folder_id}' in parents and trashed=false"
         
-        results = service.files().list(
-            q=query,
-            pageSize=100,
-            pageToken=page_token,
-            fields="nextPageToken, files(id, name, mimeType, size, modifiedTime, parents)",
-            orderBy="folder,name",
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True
-        ).execute()
+        all_items = []
+        next_page_token = page_token
         
-        items = results.get('files', [])
-        next_page_token = results.get('nextPageToken')
+        # Fetch ALL pages, not just the first one
+        while True:
+            results = service.files().list(
+                q=query,
+                pageSize=1000,  # Increased from 100 to get more per page
+                pageToken=next_page_token,
+                fields="nextPageToken, files(id, name, mimeType, size, modifiedTime, parents)",
+                orderBy="folder,name",
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True
+            ).execute()
+            
+            items = results.get('files', [])
+            all_items.extend(items)
+            
+            next_page_token = results.get('nextPageToken')
+            if not next_page_token:
+                break  # No more pages
         
         # Separate folders and files
-        folders = [item for item in items if item['mimeType'] == 'application/vnd.google-apps.folder']
-        files = [item for item in items if item['mimeType'] != 'application/vnd.google-apps.folder']
+        folders = [item for item in all_items if item['mimeType'] == 'application/vnd.google-apps.folder']
+        files = [item for item in all_items if item['mimeType'] != 'application/vnd.google-apps.folder']
         
-        return folders, files, next_page_token
+        return folders, files, None  # Return None for page_token since we fetched everything
     
     except Exception as e:
         logger.error(f"Error listing Drive files: {e}")
