@@ -587,7 +587,7 @@ def format_file_item(file_info, selected=False):
     else:
         emoji = '📎'
     
-    checkbox = '✅' if selected else '☑️'
+    checkbox = '✅' if selected else '☐'
     
     return f"{emoji} {name[:35]}..." if len(name) > 35 else f"{emoji} {name}", size, checkbox
 
@@ -618,7 +618,7 @@ def build_browser_keyboard(user_id, folders, files, total_items):
             # Folder - show select button and open button
             keyboard.append([
                 InlineKeyboardButton(checkbox, callback_data=f"browser_select|{item['id']}"),
-                InlineKeyboardButton(f"{name} ({size})", callback_data=f"browser_open|{item['id']}")
+                InlineKeyboardButton(f"{name} (N/A)", callback_data=f"browser_open|{item['id']}")
             ])
         else:
             # File - show select button and info
@@ -654,8 +654,7 @@ def build_browser_keyboard(user_id, folders, files, total_items):
     # Selection actions
     if selected:
         keyboard.append([
-            InlineKeyboardButton(f"📥 Download ({len(selected)})", callback_data="browser_download"),
-            InlineKeyboardButton(f"📤 Upload to TG ({len(selected)})", callback_data="browser_upload"),
+            InlineKeyboardButton(f"📤 Upload ({len(selected)})", callback_data="browser_download")
         ])
         keyboard.append([
             InlineKeyboardButton("❌ Clear Selection", callback_data="browser_clear")
