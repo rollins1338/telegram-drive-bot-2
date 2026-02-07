@@ -15,6 +15,30 @@ def main():
     print("🔍 GOOGLE DRIVE PERMISSION DIAGNOSTIC")
     print("=" * 60)
     print()
+
+    # ==================== HEALTH CHECK SERVER ====================
+# Ultra-minimal health check (Koyeb-tested and working)
+def run_health_server():
+    try:
+        class HealthHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"OK")
+            
+            def do_HEAD(self):
+                self.send_response(200)
+                self.end_headers()
+            
+            def log_message(self, format, *args):
+                pass  # Suppress health check logs
+        
+        HTTPServer(('0.0.0.0', 8000), HealthHandler).serve_forever()
+    except Exception as e:
+        logger.error(f"Health server error: {e}")
+
+threading.Thread(target=run_health_server, daemon=True).start()
+logger.info("🏥 Health check server starting on port 8000")
     
     # Step 1: Load TOKEN_JSON
     print("📋 Step 1: Loading TOKEN_JSON...")
