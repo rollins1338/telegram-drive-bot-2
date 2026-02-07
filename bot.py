@@ -9,7 +9,7 @@ import re
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, MessageNotModified
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload, MediaIoBaseUpload
@@ -579,12 +579,18 @@ async def download_from_drive_task(client, status_msg, file_ids, service):
                 ACTIVE_TASKS[task_id]['progress'] = int((idx - 1) / total_files * 100)
                 
                 # Update status
-                await status_msg.edit_text(
-                    f"📥 **Downloading from Drive ({idx}/{total_files})**\n"
-                    f"📄 `{filename[:50]}...`\n"
-                    f"💾 Size: {format_size(file_size)}\n"
-                    f"✅ {successful} | ❌ {failed}"
-                )
+ if status:
+                        progress = int(status.progress() * 100)
+                        try:
+                            await status_msg.edit_text(
+                                f"📥 **Downloading from Drive ({idx}/{total_files})**\n"
+                                f"📄 `{filename[:50]}...`\n"
+                                f"💾 Size: {format_size(file_size)}\n"
+                                f"📊 Progress: {progress}%\n"
+                                f"✅ {successful} | ❌ {failed}"
+                            )
+                        except MessageNotModified:
+                            pass
                 
                 # Download file from Drive
                 request = service.files().get_media(fileId=file_id)
@@ -668,7 +674,7 @@ async def download_from_drive_task(client, status_msg, file_ids, service):
             except Exception as e:
                 logger.error(f"❌ Error downloading {file_id}: {e}")
                 failed += 1
-        
+        except (MessageNotModified, Exception):
         # Final status
         await status_msg.edit_text(
             f"✅ **Download Complete!**\n\n"
@@ -1612,12 +1618,16 @@ async def handle_callback(client, query):
                 keyboard = build_browser_keyboard(user_id, folders, files, total_items)
                 breadcrumb = get_breadcrumb(session)
                 
-                await query.message.edit_text(
-                    f"📁 **File Browser**\n"
-                    f"📍 {breadcrumb}\n"
-                    f"📊 {len(folders)} folders, {len(files)} files",
-                    reply_markup=keyboard
-                )
+try:
+                    await query.message.edit_text(
+                        f"📁 **File Browser**\n"
+                        f"📍 {breadcrumb}\n"
+                        f"📊 {len(folders)} folders, {len(files)} files\n"
+                        f"✅ Selected: {len(session['selected_files'])}",
+                        reply_markup=keyboard
+                    )
+                except MessageNotModified:
+                    pass
                 await query.answer()
             
             # Select/Deselect file
