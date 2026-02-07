@@ -109,7 +109,7 @@ def get_drive_service():
         logger.info("✅ Drive service authenticated")
         return service
     except json.JSONDecodeError as e:
-        logger.error(f"Invalid TOKEN_JSON format: {e}")
+        logger.error(f"Invalid TOKEN_JSON format: Failed to parse TOKEN_JSON. Check if it's valid JSON. Error: {e}")
         return None
     except Exception as e:
         logger.error(f"Error creating Drive service: {e}")
@@ -587,7 +587,7 @@ def format_file_item(file_info, selected=False):
     else:
         emoji = '📎'
     
-    checkbox = '✅' if selected else '☐'
+    checkbox = '✅' if selected else '☑️'
     
     return f"{emoji} {name[:35]}..." if len(name) > 35 else f"{emoji} {name}", size, checkbox
 
@@ -618,7 +618,7 @@ def build_browser_keyboard(user_id, folders, files, total_items):
             # Folder - show select button and open button
             keyboard.append([
                 InlineKeyboardButton(checkbox, callback_data=f"browser_select|{item['id']}"),
-                InlineKeyboardButton(f"{name} (N/A)", callback_data=f"browser_open|{item['id']}")
+                InlineKeyboardButton(f"{name} ({size})", callback_data=f"browser_open|{item['id']}")
             ])
         else:
             # File - show select button and info
