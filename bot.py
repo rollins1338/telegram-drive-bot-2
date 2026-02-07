@@ -165,7 +165,9 @@ async def upload_task(client, status_msg, file_list, series_name=None, flat_uplo
         parent_id = DRIVE_FOLDER_ID
         if series_name and not flat_upload:
             folder_meta = {'name': series_name, 'mimeType': 'application/vnd.google-apps.folder', 'parents': [DRIVE_FOLDER_ID]}
-            q = f"name='{series_name.replace(\"'\", \"\\\\'\")}' and '{DRIVE_FOLDER_ID}' in parents and trashed=false"
+            # FIXED SYNTAX HERE: Prepared variable outside f-string
+            safe_series_name = series_name.replace("'", "\\'")
+            q = f"name='{safe_series_name}' and '{DRIVE_FOLDER_ID}' in parents and trashed=false"
             res = service.files().list(q=q).execute().get('files', [])
             parent_id = res[0]['id'] if res else service.files().create(body=folder_meta, fields='id').execute().get('id')
 
