@@ -25,7 +25,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==================== HEALTH CHECK SERVER ====================
-# Ultra-minimal health check (Koyeb-tested and working)
+# EXACT ORIGINAL CODE - DO NOT TOUCH
 def run_health_server():
     try:
         class HealthHandler(BaseHTTPRequestHandler):
@@ -140,33 +140,30 @@ async def upload_task(client, status_msg, file_list, series_name=None, flat_uplo
 
         os.makedirs("downloads", exist_ok=True)
         for idx, f_info in enumerate(file_list, 1):
-            if ACTIVE_TASKS[task_id]['cancelled']: break
+            if task_id in ACTIVE_TASKS and ACTIVE_TASKS[task_id]['cancelled']: break
             
             filename = f_info['name']
             clean_name = clean_filename(filename)
             path = f"downloads/{filename}"
 
-            # Step 1: Download
             await status_msg.edit_text(f"📥 **Downloading ({idx}/{len(file_list)})**\n`{filename}`")
             await client.download_media(message=await client.get_messages(status_msg.chat.id, f_info['msg_id']), file_name=path)
 
-            # Step 2: Folder Logic
             target_folder = parent_folder
             if not flat_upload:
                 target_folder = get_or_create_folder(service, os.path.splitext(clean_name)[0], parent_folder)
 
-            # Step 3: Resumable Upload
             media = MediaFileUpload(path, resumable=True, chunksize=5*1024*1024)
             request = service.files().create(body={'name': clean_name, 'parents': [target_folder]}, media_body=media, fields='id, size')
             
             response = None
             while response is None:
-                if ACTIVE_TASKS[task_id]['cancelled']: break
+                if task_id in ACTIVE_TASKS and ACTIVE_TASKS[task_id]['cancelled']: break
                 status, response = request.next_chunk()
                 if status:
                     prog = int(status.progress() * 100)
                     if prog % 20 == 0:
-                        try: await status_msg.edit_text(f"☁️ **Uploading ({idx}/{len(file_list)})**\n`{clean_name}`\nProgress: {prog}%")
+                        try: await status_msg.edit_text(f"☁️ **Uploading ({idx}/{len(file_list)})**\nProgress: {prog}%")
                         except: pass
 
             TOTAL_FILES += 1
@@ -174,7 +171,7 @@ async def upload_task(client, status_msg, file_list, series_name=None, flat_uplo
             if os.path.exists(path): os.remove(path)
             sync_stats(service, save=True)
 
-        await status_msg.edit_text(f"✅ **Complete!**\nFiles: {len(file_list)}\nTotal: {format_size(TOTAL_BYTES)}")
+        await status_msg.edit_text(f"✅ **Complete!**\nTotal: {format_size(TOTAL_BYTES)}")
     except Exception as e:
         await status_msg.edit_text(f"❌ Error: {e}")
     finally:
@@ -194,15 +191,16 @@ async def get_browser_menu(service, fid='root', pname="Root"):
             else:
                 btns.append([InlineKeyboardButton("📄 " + f['name'] + " (" + format_size(int(f.get('size', 0))) + ")", callback_data="mir|" + f['id'])])
         
-        # Back logic
         pid = 'root'
         if fid != 'root':
             p_res = service.files().get(fileId=fid, fields='parents').execute().get('parents', [])
             pid = p_res[0] if p_res else 'root'
             
         btns.append([InlineKeyboardButton("⬅️ Back", callback_data="brw|" + pid), InlineKeyboardButton("🏠 Menu", callback_data="back_start")])
-        return "📍 **Path:** `" + pname + "`", InlineKeyboardMarkup(btns)
-    except: return "❌ Browser error.", None
+        return "📂 **Drive Browser**\n📍 Path: `" + pname + "`", InlineKeyboardMarkup(btns)
+    except Exception as e: 
+        logger.error(f"Browser error: {e}")
+        return "❌ Error loading Drive contents.", None
 
 async def mirror_file(client, query, fid):
     service = get_drive_service()
@@ -210,7 +208,7 @@ async def mirror_file(client, query, fid):
         meta = service.files().get(fileId=fid, fields='name, size').execute()
         name, size = meta['name'], int(meta.get('size', 0))
         
-        msg = await query.message.edit_text(f"⏳ **Mirroring...**\n`{name}`")
+        msg = await query.message.edit_text(f"⏳ **Mirroring...**\n`{name}`\nDownloading...")
         os.makedirs("mirrors", exist_ok=True)
         path = f"mirrors/{name}"
 
@@ -222,6 +220,7 @@ async def mirror_file(client, query, fid):
                 st, done = dl.next_chunk()
                 if st: await msg.edit_text(f"⏳ **Mirroring...** {int(st.progress()*100)}%")
 
+        await msg.edit_text("⏳ **Mirroring...**\nUploading to Telegram...")
         if name.lower().endswith(('.mp3', '.m4b')):
             await client.send_audio(query.message.chat.id, audio=path, caption=f"✅ `{name}`")
         else:
@@ -235,15 +234,28 @@ async def mirror_file(client, query, fid):
 
 @app.on_message(filters.command("start") & filters.user(OWNER_ID))
 async def start_cmd(client, message):
-    btns = [[InlineKeyboardButton("📤 Upload Mode", callback_data="m_up")], [InlineKeyboardButton("📥 Download Mode", callback_data="m_down")]]
-    await message.reply_text("🤖 **RxUploader Command Center**\nSelect a mode to begin:", reply_markup=InlineKeyboardMarkup(btns))
+    btns = [
+        [InlineKeyboardButton("📤 Upload Mode", callback_data="m_up")],
+        [InlineKeyboardButton("📥 Download Mode", callback_data="m_down")]
+    ]
+    await message.reply_text("🤖 **RxUploader Main Menu**\nChoose your operation:", reply_markup=InlineKeyboardMarkup(btns))
 
 @app.on_callback_query(filters.regex("back_start"))
 async def back_start(client, query):
     await start_cmd(client, query.message)
 
+@app.on_callback_query(filters.regex("m_up"))
+async def m_up_handler(client, query):
+    btns = [[InlineKeyboardButton("🏠 Menu", callback_data="back_start")]]
+    await query.message.edit_text(
+        "📤 **Upload Mode Active**\n\n"
+        "Send or forward any media files (Audiobooks/Files). "
+        "I will detect if it's an album or a single file and offer organization options.",
+        reply_markup=InlineKeyboardMarkup(btns)
+    )
+
 @app.on_callback_query(filters.regex("m_down"))
-async def m_down(client, query):
+async def m_down_handler(client, query):
     s = get_drive_service()
     t, m = await get_browser_menu(s)
     await query.message.edit_text(t, reply_markup=m)
@@ -252,8 +264,11 @@ async def m_down(client, query):
 async def brw_cb(client, query):
     fid = query.data.split("|")[1]
     s = get_drive_service()
-    pn = "Folder"
-    try: pn = s.files().get(fileId=fid, fields='name').execute()['name']
+    pn = "Root" if fid == "root" else "Folder"
+    try:
+        if fid != "root":
+            f_meta = s.files().get(fileId=fid, fields='name').execute()
+            pn = f_meta.get('name', 'Folder')
     except: pass
     t, m = await get_browser_menu(s, fid, pn)
     await query.message.edit_text(t, reply_markup=m)
@@ -264,7 +279,6 @@ async def mir_cb(client, query):
 
 @app.on_message(filters.media & filters.user(OWNER_ID))
 async def media_handler(client, message):
-    # Restore Album Logic
     m_type = message.media.value
     f_obj = getattr(message, m_type)
     fname = getattr(f_obj, 'file_name', f"file_{message.id}")
@@ -277,18 +291,18 @@ async def media_handler(client, message):
             ALBUMS[gid] = []
             async def process_album():
                 await asyncio.sleep(2)
+                if gid not in ALBUMS: return
                 f_list = ALBUMS.pop(gid)
                 key = f"alb_{gid}"
                 TEMP_FILES[key] = f_list
                 det_cap = next((f['caption'] for f in f_list if f['caption']), None)
                 cl_name = clean_series_name(f_list[0]['name'])
-                
                 btns = []
                 if det_cap: btns.append([InlineKeyboardButton(f"📂 Series: {det_cap[:25]}", callback_data=f"cap|{key}")])
                 else: btns.append([InlineKeyboardButton(f"📂 Series: {cl_name[:25]}", callback_data=f"auto|{key}")])
                 btns.append([InlineKeyboardButton("📁 Standalone", callback_data=f"std|{key}")])
-                btns.append([InlineKeyboardButton("🚫 Not Audiobook", callback_data=f"root|{key}")])
                 btns.append([InlineKeyboardButton("✏️ Custom Name", callback_data=f"cust|{key}")])
+                btns.append([InlineKeyboardButton("🚫 Root", callback_data=f"root|{key}")])
                 await message.reply_text(f"📦 **Album Detected** ({len(f_list)} files)", reply_markup=InlineKeyboardMarkup(btns))
             asyncio.create_task(process_album())
         ALBUMS[gid].append(info)
@@ -301,7 +315,7 @@ async def media_handler(client, message):
         else: btns.append([InlineKeyboardButton(f"📂 Series: {cl_name[:25]}", callback_data=f"auto|{key}")])
         btns.append([InlineKeyboardButton("📁 Standalone", callback_data=f"std|{key}")])
         btns.append([InlineKeyboardButton("✏️ Custom Name", callback_data=f"cust|{key}")])
-        btns.append([InlineKeyboardButton("🚫 Not Audiobook", callback_data=f"root|{key}")])
+        btns.append([InlineKeyboardButton("🚫 Root", callback_data=f"root|{key}")])
         await message.reply_text(f"📄 **File:** `{fname}`", reply_markup=InlineKeyboardMarkup(btns))
 
 @app.on_callback_query(filters.regex(r"^(cap|auto|std|root|cust)\|"))
@@ -309,17 +323,14 @@ async def up_callback(client, query):
     mode, key = query.data.split("|")
     files = TEMP_FILES.get(key)
     if not files: return await query.answer("Session Expired.")
-
     if mode == "cust":
         ACTIVE_SERIES[query.from_user.id] = {'files': files, 'key': key}
         return await query.message.edit_text("✏️ Reply with the **Custom Series Name**:")
-
     series = None
     flat = False
     if mode == "cap": series = next((f['caption'] for f in files if f['caption']), "Unknown")
     elif mode == "auto": series = clean_series_name(files[0]['name'])
     elif mode == "root": flat = True
-
     await query.message.edit_text("🚀 Starting upload task...")
     asyncio.create_task(upload_task(client, query.message, files, series, flat))
     TEMP_FILES.pop(key, None)
