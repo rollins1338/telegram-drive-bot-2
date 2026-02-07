@@ -615,11 +615,11 @@ def build_browser_keyboard(user_id, folders, files, total_items):
         name, size, checkbox = format_file_item(item, is_selected)
         
         if is_folder:
-            # Folder - click to open
-            keyboard.append([InlineKeyboardButton(
-                f"{name} ({size})",
-                callback_data=f"browser_open|{item['id']}"
-            )])
+            # Folder - show select button and open button
+            keyboard.append([
+                InlineKeyboardButton(checkbox, callback_data=f"browser_select|{item['id']}"),
+                InlineKeyboardButton(f"{name} ({size})", callback_data=f"browser_open|{item['id']}")
+            ])
         else:
             # File - show select button and info
             keyboard.append([
@@ -654,8 +654,11 @@ def build_browser_keyboard(user_id, folders, files, total_items):
     # Selection actions
     if selected:
         keyboard.append([
-            InlineKeyboardButton(f"⬇️ Download ({len(selected)})", callback_data="browser_download"),
-            InlineKeyboardButton("❌ Clear", callback_data="browser_clear")
+            InlineKeyboardButton(f"📥 Download ({len(selected)})", callback_data="browser_download"),
+            InlineKeyboardButton(f"📤 Upload to TG ({len(selected)})", callback_data="browser_upload"),
+        ])
+        keyboard.append([
+            InlineKeyboardButton("❌ Clear Selection", callback_data="browser_clear")
         ])
     
     # Utility buttons
@@ -811,6 +814,155 @@ async def download_from_drive_task(client, status_msg, file_ids, service):
     
     except Exception as e:
         logger.error(f"Download task error: {e}")
+        await status_msg.edit_text(f"❌ **Error:** {str(e)}")
+    
+    finally:
+        if task_id in ACTIVE_TASKS:
+            del ACTIVE_TASKS[task_id]
+
+async def upload_to_telegram_task(client, status_msg, folders, files, service):
+    """Upload selected folders and files from Drive to Telegram"""
+    task_id = f"upload_tg_{status_msg.chat.id}_{status_msg.id}"
+    ACTIVE_TASKS[task_id] = {
+        'cancelled': False,
+        'files_list': [],
+        'current_file': None,
+        'progress': 0,
+        'status': 'initializing'
+    }
+    
+    successful = 0
+    failed = 0
+    
+    try:
+        # Collect all files from folders
+        all_files = []
+        
+        # Add direct files
+        for file_meta in files:
+            all_files.append(file_meta)
+        
+        # Add files from folders
+        for folder in folders:
+            folder_name = folder['name']
+            _, files_in_folder, _ = list_drive_files(service, folder['id'])
+            
+            for file_meta in files_in_folder:
+                file_meta['folder_name'] = folder_name
+                all_files.append(file_meta)
+        
+        total_files = len(all_files)
+        ACTIVE_TASKS[task_id]['files_list'] = [f['id'] for f in all_files]
+        
+        # Upload each file
+        for idx, file_meta in enumerate(all_files, 1):
+            # Check for cancellation
+            if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
+                await status_msg.edit_text(
+                    f"🛑 **Upload Cancelled**\n\n"
+                    f"✅ Sent: {successful}/{total_files}\n"
+                    f"❌ Failed: {failed}"
+                )
+                return
+            
+            try:
+                file_id = file_meta['id']
+                filename = file_meta['name']
+                file_size = int(file_meta.get('size', 0))
+                folder_name = file_meta.get('folder_name', None)
+                
+                ACTIVE_TASKS[task_id]['current_file'] = filename
+                ACTIVE_TASKS[task_id]['progress'] = int((idx - 1) / total_files * 100)
+                
+                # Update status
+                status_text = (
+                    f"📤 **Uploading to Telegram ({idx}/{total_files})**\n"
+                )
+                if folder_name:
+                    status_text += f"📁 Folder: {folder_name}\n"
+                status_text += (
+                    f"📄 `{filename[:50]}...`\n"
+                    f"💾 Size: {format_size(file_size)}\n"
+                    f"✅ {successful} | ❌ {failed}"
+                )
+                
+                await status_msg.edit_text(status_text)
+                
+                # Download file from Drive
+                request = service.files().get_media(fileId=file_id)
+                download_path = f"downloads/{filename}"
+                
+                os.makedirs("downloads", exist_ok=True)
+                
+                fh = io.FileIO(download_path, 'wb')
+                downloader = MediaIoBaseDownload(fh, request)
+                
+                done = False
+                while not done:
+                    if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
+                        fh.close()
+                        if os.path.exists(download_path):
+                            os.remove(download_path)
+                        return
+                    
+                    status, done = downloader.next_chunk()
+                
+                fh.close()
+                
+                # Send to Telegram
+                caption = filename
+                if folder_name:
+                    caption = f"📁 {folder_name}\n📄 {filename}"
+                
+                mime_type = file_meta.get('mimeType', '')
+                
+                # Send based on file type
+                if 'video' in mime_type or download_path.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm')):
+                    await client.send_video(
+                        status_msg.chat.id,
+                        download_path,
+                        caption=caption
+                    )
+                elif 'audio' in mime_type or download_path.lower().endswith(('.mp3', '.m4a', '.m4b', '.flac', '.wav', '.ogg', '.aac', '.opus')):
+                    await client.send_audio(
+                        status_msg.chat.id,
+                        download_path,
+                        caption=caption
+                    )
+                elif 'image' in mime_type or download_path.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
+                    await client.send_photo(
+                        status_msg.chat.id,
+                        download_path,
+                        caption=caption
+                    )
+                else:
+                    await client.send_document(
+                        status_msg.chat.id,
+                        download_path,
+                        caption=caption
+                    )
+                
+                # Clean up
+                if os.path.exists(download_path):
+                    os.remove(download_path)
+                
+                successful += 1
+                logger.info(f"✅ Uploaded to Telegram: {filename}")
+                
+            except Exception as e:
+                logger.error(f"❌ Error uploading {filename}: {e}")
+                failed += 1
+        
+        # Final status
+        await status_msg.edit_text(
+            f"✅ **Upload Complete!**\n"
+            f"━━━━━━━━━━━━━━━\n\n"
+            f"✅ Successful: {successful}/{total_files}\n"
+            f"❌ Failed: {failed}"
+        )
+    
+    except Exception as e:
+        logger.error(f"Upload to Telegram task error: {e}")
         await status_msg.edit_text(f"❌ **Error:** {str(e)}")
     
     finally:
@@ -1851,6 +2003,66 @@ async def handle_callback(client, query):
                 # Clear selection
                 session['selected_files'] = []
                 await query.answer(f"📥 Downloading {file_count} files...", show_alert=False)
+            
+            # Upload to Telegram
+            elif query.data == "browser_upload":
+                if not session['selected_files']:
+                    await query.answer("❌ No files selected", show_alert=True)
+                    return
+                
+                # Separate folders and files
+                selected_folders = []
+                selected_files = []
+                
+                for item_id in session['selected_files']:
+                    try:
+                        metadata = service.files().get(fileId=item_id, fields="id, name, mimeType").execute()
+                        if metadata['mimeType'] == 'application/vnd.google-apps.folder':
+                            selected_folders.append(metadata)
+                        else:
+                            selected_files.append(metadata)
+                    except Exception as e:
+                        logger.error(f"Error getting metadata for {item_id}: {e}")
+                
+                # Check if folders have subfolders
+                valid_folders = []
+                invalid_folders = []
+                
+                for folder in selected_folders:
+                    subfolders, files_in_folder, _ = list_drive_files(service, folder['id'])
+                    if len(subfolders) > 0:
+                        invalid_folders.append(folder['name'])
+                    else:
+                        valid_folders.append(folder)
+                
+                if invalid_folders:
+                    await query.answer(
+                        f"❌ Cannot upload folders with subfolders:\n" + "\n".join(invalid_folders[:3]),
+                        show_alert=True
+                    )
+                    return
+                
+                total_items = len(valid_folders) + len(selected_files)
+                await query.message.edit_text(
+                    f"📤 **Uploading to Telegram**\n\n"
+                    f"📁 Folders: {len(valid_folders)}\n"
+                    f"📄 Files: {len(selected_files)}\n"
+                    f"📦 Total items: {total_items}\n\n"
+                    f"⏳ Starting..."
+                )
+                
+                # Start upload task
+                asyncio.create_task(upload_to_telegram_task(
+                    client,
+                    query.message,
+                    valid_folders,
+                    selected_files,
+                    service
+                ))
+                
+                # Clear selection
+                session['selected_files'] = []
+                await query.answer(f"📤 Uploading {total_items} items...", show_alert=False)
             
             # Clear selection
             elif query.data == "browser_clear":
