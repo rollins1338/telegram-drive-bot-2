@@ -1366,7 +1366,7 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
             'completed': 0,
             'lock': asyncio.Lock(),
             'active_workers': [],
-            'stop_updater': False  # Flag to stop status updater
+            'stop_updater': False
         }
         
         # Create queue for files
@@ -1410,15 +1410,12 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
                             'filename': filename,
                             'folder': folder_name,
                             'stage': 'downloading',
-                            'progress': None,
-                            'current_bytes': None,
+                            'progress': 0,
+                            'current_bytes': 0,
                             'total_bytes': file_size,
-                            'speed': None,
-                            'eta': None
+                            'speed': 0,
+                            'eta': 'Calculating...'
                         })
-                        completed = upload_state['completed']
-                        successful = upload_state['successful']
-                        failed = upload_state['failed']
                     
                     # Download file from Drive
                     request = service.files().get_media(fileId=file_id)
@@ -1475,7 +1472,7 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
                                 last_drive_speed_update = current_time
                                 last_drive_bytes = current_bytes
                                 
-                                # Update worker state with progress
+                                # Update worker state
                                 async with upload_state['lock']:
                                     for worker in upload_state['active_workers']:
                                         if worker['worker_id'] == worker_id:
@@ -1488,11 +1485,15 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
                     
                     fh.close()
                     
-                    # Update worker stage
+                    # Update worker stage to uploading and reset progress
                     async with upload_state['lock']:
                         for worker in upload_state['active_workers']:
                             if worker['worker_id'] == worker_id:
                                 worker['stage'] = 'uploading'
+                                worker['progress'] = 0
+                                worker['current_bytes'] = 0
+                                worker['speed'] = 0
+                                worker['eta'] = 'Starting...'
                                 break
                     
                     # Send to Telegram with progress tracking
@@ -1522,13 +1523,9 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
                         if current_time - last_progress_update >= 2:
                             last_progress_update = current_time
                             
-                            progress_pct = int((current / total) * 100) if total > 0 else 0
-                            progress_bar = create_progress_bar(progress_pct, length=12)
-                            
                             # Calculate speed
                             elapsed = current_time - upload_start_time
                             speed = current / elapsed if elapsed > 0 else 0
-                            speed_str = f"{format_size(int(speed))}/s"
                             
                             # Calculate ETA
                             remaining = total - current
@@ -1658,7 +1655,7 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
                             worker_lines.append(f"📄 `{worker['filename'][:35]}...`")
                             
                             # Progress info if available
-                            if worker.get('progress') is not None:
+                            if worker.get('progress') is not None and worker['progress'] > 0:
                                 progress_bar = create_progress_bar(worker['progress'], length=12)
                                 worker_lines.append(f"{progress_bar}")
                                 
@@ -1685,12 +1682,12 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
                     except:
                         pass
                     
-                    # Update every 1.5 seconds
-                    await asyncio.sleep(1.5)
+                    # Update every 1 second
+                    await asyncio.sleep(1)
                     
                 except Exception as e:
                     logger.debug(f"Status updater error: {e}")
-                    await asyncio.sleep(1.5)
+                    await asyncio.sleep(1)
         
         # Start 2 concurrent workers
         worker_tasks = [
@@ -1709,7 +1706,10 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
         
         # Stop status updater
         upload_state['stop_updater'] = True
-        await updater_task  # Wait for updater to finish
+        try:
+            await asyncio.wait_for(updater_task, timeout=2.0)
+        except:
+            pass
         
         # Final status
         elapsed_time = time.time() - start_time
@@ -1963,7 +1963,8 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
             'total_size_uploaded': 0,
             'completed': 0,
             'lock': asyncio.Lock(),
-            'active_workers': []
+            'active_workers': [],
+            'stop_updater': False
         }
         
         # Create queue for files
@@ -1998,31 +1999,13 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
                     upload_state['active_workers'].append({
                         'worker_id': worker_id,
                         'filename': filename,
-                        'stage': 'downloading'
+                        'stage': 'downloading',
+                        'progress': 0,
+                        'current_bytes': 0,
+                        'total_bytes': 0,
+                        'speed': 0,
+                        'eta': 'Starting...'
                     })
-                    completed = upload_state['completed']
-                    successful = upload_state['successful_uploads']
-                    failed = len(upload_state['failed_uploads'])
-                
-                # Update status
-                status_lines = [
-                    f"📤 **Upload to Drive**",
-                    f"━━━━━━━━━━━━━━━",
-                    f"📊 Progress: {completed}/{len(file_list)}",
-                    f"✅ Success: {successful} | ❌ Failed: {failed}",
-                    f"",
-                    f"🔄 **Active:**"
-                ]
-                
-                for worker in upload_state['active_workers']:
-                    stage_icon = "📥" if worker['stage'] == 'downloading' else "☁️"
-                    worker_line = f"{stage_icon} W{worker['worker_id']}: {worker['filename'][:30]}..."
-                    status_lines.append(worker_line)
-                
-                try:
-                    await status_msg.edit_text("\n".join(status_lines))
-                except:
-                    pass
                 
                 try:
                     # Auto-retry logic
@@ -2039,12 +2022,41 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
                             # Download file from Telegram
                             download_path = f"downloads/{filename}"
                             download_start = time.time()
+                            last_download_update = 0
+                            
+                            # Progress callback for Telegram download
+                            async def download_progress_callback(current, total):
+                                nonlocal last_download_update
+                                current_time = time.time()
+                                
+                                # Update every 1.5 seconds
+                                if current_time - last_download_update >= 1.5:
+                                    last_download_update = current_time
+                                    
+                                    progress_pct = int((current / total) * 100) if total > 0 else 0
+                                    elapsed = current_time - download_start
+                                    speed = current / elapsed if elapsed > 0 else 0
+                                    remaining = total - current
+                                    eta = remaining / speed if speed > 0 else 0
+                                    eta_str = format_time(int(eta))
+                                    
+                                    # Update worker state
+                                    async with upload_state['lock']:
+                                        for worker in upload_state['active_workers']:
+                                            if worker['worker_id'] == worker_id:
+                                                worker['progress'] = progress_pct
+                                                worker['current_bytes'] = current
+                                                worker['total_bytes'] = total
+                                                worker['speed'] = int(speed)
+                                                worker['eta'] = eta_str
+                                                break
                             
                             try:
                                 message = await client.get_messages(status_msg.chat.id, msg_id)
                                 await client.download_media(
                                     message,
-                                    file_name=download_path
+                                    file_name=download_path,
+                                    progress=download_progress_callback
                                 )
                             except FloodWait as e:
                                 logger.warning(f"Worker {worker_id}: FloodWait {e.value}s")
@@ -2052,7 +2064,8 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
                                 message = await client.get_messages(status_msg.chat.id, msg_id)
                                 await client.download_media(
                                     message,
-                                    file_name=download_path
+                                    file_name=download_path,
+                                    progress=download_progress_callback
                                 )
                             
                             # Check for cancellation after download
@@ -2066,13 +2079,6 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
                                 raise Exception("Download failed - file not found")
                             
                             file_size = os.path.getsize(download_path)
-                            
-                            # Update worker stage
-                            async with upload_state['lock']:
-                                for worker in upload_state['active_workers']:
-                                    if worker['worker_id'] == worker_id:
-                                        worker['stage'] = 'uploading'
-                                        break
                             
                             # Handle folder logic
                             if flat_upload:
@@ -2113,12 +2119,43 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
                                 filename
                             )
                             
-                            # Monitor progress
+                            # Update worker stage to uploading
+                            async with upload_state['lock']:
+                                for worker in upload_state['active_workers']:
+                                    if worker['worker_id'] == worker_id:
+                                        worker['stage'] = 'uploading'
+                                        worker['progress'] = 0
+                                        worker['current_bytes'] = 0
+                                        worker['total_bytes'] = file_size
+                                        worker['speed'] = 0
+                                        worker['eta'] = 'Starting...'
+                                        break
+                            
+                            # Monitor progress and update worker state
+                            last_progress_update = time.time()
                             while not progress_data.get('complete') and not progress_data.get('error') and not progress_data.get('cancelled'):
                                 if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
                                     progress_data['cancelled'] = True
                                     break
-                                await asyncio.sleep(1)
+                                
+                                # Update worker state from progress_data
+                                current_time = time.time()
+                                if current_time - last_progress_update >= 1:
+                                    last_progress_update = current_time
+                                    last_prog = progress_data.get('last_progress')
+                                    
+                                    if last_prog:
+                                        async with upload_state['lock']:
+                                            for worker in upload_state['active_workers']:
+                                                if worker['worker_id'] == worker_id:
+                                                    worker['progress'] = last_prog.get('progress', 0)
+                                                    worker['current_bytes'] = last_prog.get('current', 0)
+                                                    worker['total_bytes'] = last_prog.get('total', file_size)
+                                                    worker['speed'] = int(last_prog.get('speed', 0))
+                                                    worker['eta'] = last_prog.get('eta', 'Calculating...')
+                                                    break
+                                
+                                await asyncio.sleep(0.5)
                             
                             # Check if cancelled
                             if progress_data.get('cancelled') or ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
@@ -2193,17 +2230,95 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
                         ]
                     file_queue.task_done()
         
+        # Status updater task - updates message with all active workers
+        async def status_updater():
+            while not upload_state['stop_updater']:
+                try:
+                    async with upload_state['lock']:
+                        completed = upload_state['completed']
+                        successful = upload_state['successful_uploads']
+                        failed = len(upload_state['failed_uploads'])
+                        workers = list(upload_state['active_workers'])
+                    
+                    # Build status message with all workers
+                    status_lines = [
+                        f"📤 **Uploading to Google Drive**",
+                        f"━━━━━━━━━━━━━━━",
+                        f"📊 Overall: {completed}/{len(file_list)}",
+                        f"✅ Success: {successful} | ❌ Failed: {failed}",
+                        ""
+                    ]
+                    
+                    if workers:
+                        status_lines.append("🔄 **Active Workers:**")
+                        status_lines.append("")
+                        
+                        for worker in workers:
+                            worker_lines = []
+                            stage_icon = "📥" if worker['stage'] == 'downloading' else "☁️"
+                            
+                            # Worker header
+                            worker_lines.append(f"{stage_icon} **Worker {worker['worker_id']}:**")
+                            
+                            # Filename
+                            worker_lines.append(f"📄 `{worker['filename'][:35]}...`")
+                            
+                            # Progress info if available
+                            if worker.get('progress') is not None and worker['progress'] > 0:
+                                progress_bar = create_progress_bar(worker['progress'], length=12)
+                                worker_lines.append(f"{progress_bar}")
+                                
+                                if worker.get('current_bytes') and worker.get('total_bytes'):
+                                    worker_lines.append(
+                                        f"💾 {format_size(worker['current_bytes'])} / {format_size(worker['total_bytes'])}"
+                                    )
+                                
+                                if worker.get('speed'):
+                                    worker_lines.append(f"⚡ {format_size(worker['speed'])}/s")
+                                
+                                if worker.get('eta'):
+                                    worker_lines.append(f"⏱️ {worker['eta']}")
+                            
+                            # Add worker info to status
+                            status_lines.extend(worker_lines)
+                            status_lines.append("")  # Empty line between workers
+                    
+                    # Update message
+                    try:
+                        await status_msg.edit_text("\n".join(status_lines))
+                    except FloodWait as e:
+                        await asyncio.sleep(e.value)
+                    except:
+                        pass
+                    
+                    # Update every 1 second
+                    await asyncio.sleep(1)
+                    
+                except Exception as e:
+                    logger.debug(f"Status updater error: {e}")
+                    await asyncio.sleep(1)
+        
         # Start 2 concurrent workers
-        workers = [
+        worker_tasks = [
             asyncio.create_task(upload_worker(1)),
             asyncio.create_task(upload_worker(2))
         ]
         
-        # Wait for all workers to complete
-        await asyncio.gather(*workers, return_exceptions=True)
+        # Start status updater
+        updater_task = asyncio.create_task(status_updater())
+        
+        # Wait for workers to complete
+        await asyncio.gather(*worker_tasks, return_exceptions=True)
         
         # Wait for queue to be fully processed
         await file_queue.join()
+        
+        # Stop status updater
+        upload_state['stop_updater'] = True
+        try:
+            await asyncio.wait_for(updater_task, timeout=2.0)
+        except:
+            pass
         
         # Get final counts
         successful_uploads = upload_state['successful_uploads']
