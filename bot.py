@@ -1857,157 +1857,165 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
                 except:
                     pass
                 
-                # Auto-retry logic
-                retry_count = 0
-                upload_success = False
-                
-                while retry_count < MAX_RETRIES and not upload_success:
-                    try:
-                        # Check for cancellation
-                        if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
-                            file_queue.task_done()
-                            return
-                        
-                        # Download file from Telegram
-                        download_path = f"downloads/{filename}"
-                        download_start = time.time()
-                        
-                        try:
-                            message = await client.get_messages(status_msg.chat.id, msg_id)
-                            await client.download_media(
-                                message,
-                                file_name=download_path
-                            )
-                        except FloodWait as e:
-                            logger.warning(f"Worker {worker_id}: FloodWait {e.value}s")
-                            await asyncio.sleep(e.value)
-                            message = await client.get_messages(status_msg.chat.id, msg_id)
-                            await client.download_media(
-                                message,
-                                file_name=download_path
-                            )
-                        
-                        # Check for cancellation after download
-                        if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
-                            if download_path and os.path.exists(download_path):
-                                os.remove(download_path)
-                            file_queue.task_done()
-                            return
-                        
-                        if not os.path.exists(download_path):
-                            raise Exception("Download failed - file not found")
-                        
-                        file_size = os.path.getsize(download_path)
-                        
-                        # Update worker stage
-                        async with upload_state['lock']:
-                            for worker in upload_state['active_workers']:
-                                if worker['worker_id'] == worker_id:
-                                    worker['stage'] = 'uploading'
-                                    break
-                        
-                        # Handle folder logic
-                        if flat_upload:
-                            upload_folder = parent_folder
-                        else:
-                            folder_name = os.path.splitext(clean_name)[0]
-                            file_folder = get_or_create_folder(service, folder_name, parent_folder)
-                            
-                            if not file_folder:
-                                raise Exception("Failed to create file folder")
-                            
-                            upload_folder = file_folder
-                        
-                        # Upload to Drive
-                        file_metadata = {
-                            'name': clean_name,
-                            'parents': [upload_folder]
-                        }
-                        
-                        # Shared data for progress tracking
-                        progress_data = {
-                            'complete': False,
-                            'error': None,
-                            'last_progress': None,
-                            'task_id': task_id,
-                            'cancelled': False
-                        }
-                        
-                        # Start upload in executor
-                        loop = asyncio.get_running_loop()
-                        upload_future = loop.run_in_executor(
-                            None,
-                            upload_to_drive_with_progress,
-                            service,
-                            download_path,
-                            file_metadata,
-                            progress_data,
-                            filename
-                        )
-                        
-                        # Monitor progress
-                        while not progress_data.get('complete') and not progress_data.get('error') and not progress_data.get('cancelled'):
-                            if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
-                                progress_data['cancelled'] = True
-                                break
-                            await asyncio.sleep(1)
-                        
-                        # Check if cancelled
-                        if progress_data.get('cancelled') or ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
-                            if download_path and os.path.exists(download_path):
-                                os.remove(download_path)
-                            file_queue.task_done()
-                            return
-                        
-                        # Wait for upload to complete
-                        upload_result = await upload_future
-                        
-                        if progress_data.get('error'):
-                            raise Exception(progress_data['error'])
-                        
-                        if upload_result is None:
-                            raise Exception("Upload was cancelled")
-                        
-                        # Update stats
-                        uploaded_size = int(upload_result.get('size', file_size))
-                        
-                        async with upload_state['lock']:
-                            upload_state['successful_uploads'] += 1
-                            upload_state['total_size_uploaded'] += uploaded_size
-                            upload_state['completed'] += 1
-                            
-                            # Update global stats
-                            global TOTAL_FILES, TOTAL_BYTES
-                            TOTAL_FILES += 1
-                            TOTAL_BYTES += uploaded_size
-                        
-                        # Clean up downloaded file
-                        if os.path.exists(download_path):
-                            os.remove(download_path)
-                        
-                        upload_success = True
-                        logger.info(f"✅ Worker {worker_id}: {filename} ({uploaded_size/1024/1024:.2f} MB)")
+                try:
+                    # Auto-retry logic
+                    retry_count = 0
+                    upload_success = False
                     
-                    except Exception as e:
-                        retry_count += 1
-                        logger.error(f"❌ Worker {worker_id}: {filename} (attempt {retry_count}/{MAX_RETRIES}): {e}")
-                        
-                        if retry_count < MAX_RETRIES:
-                            wait_time = RETRY_DELAY * (2 ** (retry_count - 1))
-                            logger.info(f"Worker {worker_id} retrying in {wait_time}s...")
-                            await asyncio.sleep(wait_time)
-                        else:
-                            async with upload_state['lock']:
-                                upload_state['failed_uploads'].append(f"{filename}: {str(e)[:50]}")
-                                upload_state['completed'] += 1
-                            record_failed_upload(task_id, filename, e)
-                        
-                        # Clean up on error
-                        if download_path and os.path.exists(download_path):
+                    while retry_count < MAX_RETRIES and not upload_success:
+                        try:
+                            # Check for cancellation
+                            if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
+                                file_queue.task_done()
+                                return
+                            
+                            # Download file from Telegram
+                            download_path = f"downloads/{filename}"
+                            download_start = time.time()
+                            
                             try:
+                                message = await client.get_messages(status_msg.chat.id, msg_id)
+                                await client.download_media(
+                                    message,
+                                    file_name=download_path
+                                )
+                            except FloodWait as e:
+                                logger.warning(f"Worker {worker_id}: FloodWait {e.value}s")
+                                await asyncio.sleep(e.value)
+                                message = await client.get_messages(status_msg.chat.id, msg_id)
+                                await client.download_media(
+                                    message,
+                                    file_name=download_path
+                                )
+                            
+                            # Check for cancellation after download
+                            if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
+                                if download_path and os.path.exists(download_path):
+                                    os.remove(download_path)
+                                file_queue.task_done()
+                                return
+                            
+                            if not os.path.exists(download_path):
+                                raise Exception("Download failed - file not found")
+                            
+                            file_size = os.path.getsize(download_path)
+                            
+                            # Update worker stage
+                            async with upload_state['lock']:
+                                for worker in upload_state['active_workers']:
+                                    if worker['worker_id'] == worker_id:
+                                        worker['stage'] = 'uploading'
+                                        break
+                            
+                            # Handle folder logic
+                            if flat_upload:
+                                upload_folder = parent_folder
+                            else:
+                                folder_name = os.path.splitext(clean_name)[0]
+                                file_folder = get_or_create_folder(service, folder_name, parent_folder)
+                                
+                                if not file_folder:
+                                    raise Exception("Failed to create file folder")
+                                
+                                upload_folder = file_folder
+                            
+                            # Upload to Drive
+                            file_metadata = {
+                                'name': clean_name,
+                                'parents': [upload_folder]
+                            }
+                            
+                            # Shared data for progress tracking
+                            progress_data = {
+                                'complete': False,
+                                'error': None,
+                                'last_progress': None,
+                                'task_id': task_id,
+                                'cancelled': False
+                            }
+                            
+                            # Start upload in executor
+                            loop = asyncio.get_running_loop()
+                            upload_future = loop.run_in_executor(
+                                None,
+                                upload_to_drive_with_progress,
+                                service,
+                                download_path,
+                                file_metadata,
+                                progress_data,
+                                filename
+                            )
+                            
+                            # Monitor progress
+                            while not progress_data.get('complete') and not progress_data.get('error') and not progress_data.get('cancelled'):
+                                if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
+                                    progress_data['cancelled'] = True
+                                    break
+                                await asyncio.sleep(1)
+                            
+                            # Check if cancelled
+                            if progress_data.get('cancelled') or ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
+                                if download_path and os.path.exists(download_path):
+                                    os.remove(download_path)
+                                file_queue.task_done()
+                                return
+                            
+                            # Wait for upload to complete
+                            upload_result = await upload_future
+                            
+                            if progress_data.get('error'):
+                                raise Exception(progress_data['error'])
+                            
+                            if upload_result is None:
+                                raise Exception("Upload was cancelled")
+                            
+                            # Update stats
+                            uploaded_size = int(upload_result.get('size', file_size))
+                            
+                            async with upload_state['lock']:
+                                upload_state['successful_uploads'] += 1
+                                upload_state['total_size_uploaded'] += uploaded_size
+                                upload_state['completed'] += 1
+                                
+                                # Update global stats
+                                global TOTAL_FILES, TOTAL_BYTES
+                                TOTAL_FILES += 1
+                                TOTAL_BYTES += uploaded_size
+                            
+                            # Clean up downloaded file
+                            if os.path.exists(download_path):
                                 os.remove(download_path)
-                            except:
-                                pass
+                            
+                            upload_success = True
+                            logger.info(f"✅ Worker {worker_id}: {filename} ({uploaded_size/1024/1024:.2f} MB)")
+                        
+                        except Exception as e:
+                            retry_count += 1
+                            logger.error(f"❌ Worker {worker_id}: {filename} (attempt {retry_count}/{MAX_RETRIES}): {e}")
+                            
+                            if retry_count < MAX_RETRIES:
+                                wait_time = RETRY_DELAY * (2 ** (retry_count - 1))
+                                logger.info(f"Worker {worker_id} retrying in {wait_time}s...")
+                                await asyncio.sleep(wait_time)
+                            else:
+                                async with upload_state['lock']:
+                                    upload_state['failed_uploads'].append(f"{filename}: {str(e)[:50]}")
+                                    upload_state['completed'] += 1
+                                record_failed_upload(task_id, filename, e)
+                            
+                            # Clean up on error
+                            if download_path and os.path.exists(download_path):
+                                try:
+                                    os.remove(download_path)
+                                except:
+                                    pass
+                
+                except Exception as e:
+                    # Catch any unexpected errors in the worker
+                    logger.error(f"Worker {worker_id} unexpected error: {e}")
+                    async with upload_state['lock']:
+                        upload_state['failed_uploads'].append(f"{filename}: {str(e)[:50]}")
+                        upload_state['completed'] += 1
                 
                 finally:
                     # Remove from active workers
