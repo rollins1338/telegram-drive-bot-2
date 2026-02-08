@@ -1,24 +1,3 @@
-"""
-FIXED VERSION - Changes made:
-
-PHASE 1 - CONCURRENT LOGIC FIXES:
-✅ Fixed MESSAGE_NOT_MODIFIED errors by tracking last message text in status updaters
-✅ Fixed concurrent workers progress display - both workers now show progress simultaneously
-✅ Improved status update frequency (2s intervals) to reduce Telegram API load
-✅ Added proper error handling for MESSAGE_NOT_MODIFIED in all status updates
-
-PHASE 2 - UI OVERHAUL:
-✅ Removed duplicate emojis in file browser (emojis were appearing twice)
-✅ Audio files now use 🎧 headphone emoji (mp3, m4b, m4a, flac, wav, ogg, aac, opus)
-✅ Video files use 🎬 film emoji
-✅ Removed N/A for folders - only files show sizes
-✅ Merged "Select All on Page" and "Select All Files" into single button
-✅ Changed "Clear" to "Cancel" for better UX
-✅ Fixed button error handling to prevent crashes
-
-All changes maintain existing functionality while improving stability and UX.
-"""
-
 import os
 import json
 import asyncio
