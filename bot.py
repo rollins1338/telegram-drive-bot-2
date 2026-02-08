@@ -2353,23 +2353,86 @@ async def progress_callback(current, total, message, start_time, filename, task_
         message.last_current = current
         message.last_time = now
 
-async def upload_task(client, status_msg, file_list, series_name=None, flat_upload=False, queue_id=None, parent_folder_id=None):
-    """Upload files from Telegram to Drive with TRUE concurrency"""
-    # ... (setup parent folder - keep your existing code)
+async def upload_to_telegram_concurrent(client, status_msg, file_list, service):
+    """
+    Upload multiple files from Drive to Telegram with TRUE concurrency
     
-    # Call new concurrent function
-    successful, failed = await upload_to_drive_concurrent(
-        client, status_msg, file_list, service, parent_folder, flat_upload
-    )
+    Strategy:
+    - Process files in batches of 2
+    - Each batch runs 2 files in PARALLEL using asyncio.gather()
+    - No fake workers, just pure concurrent tasks
+    """
+    task_id = f"drive_to_tg_{status_msg.chat.id}_{int(time.time())}"
     
-    # Show final status
-    elapsed = time.time() - start_time
-    await status_msg.edit_text(
-        f"✅ **Complete!**\n"
-        f"✅ Success: {successful}\n"
-        f"❌ Failed: {failed}\n"
-        f"⏱️ Time: {format_time(int(elapsed))}"
-    )
+    # Shared state for all tasks
+    task_state = {
+        'successful': 0,
+        'failed': 0,
+        'files': {},  # {filename: {stage, progress, current, total, speed, eta}}
+        'lock': asyncio.Lock(),
+        'cancelled': False
+    }
+    
+    total_files = len(file_list)
+    
+    # Process files in batches of 2 (true parallel execution!)
+    for i in range(0, total_files, 2):
+        batch = file_list[i:i+2]
+        
+        # Create tasks for this batch
+        tasks = [
+            process_one_file_drive_to_telegram(
+                client, service, file_meta, task_id, task_state, status_msg
+            )
+            for file_meta in batch
+        ]
+        
+        # Run tasks IN PARALLEL (this is the magic!)
+        # Both files will download from Drive SIMULTANEOUSLY
+        # Both files will upload to Telegram SIMULTANEOUSLY
+        await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Final status
+    return task_state['successful'], task_state['failed']
+
+
+async def upload_to_drive_concurrent(client, status_msg, file_list, service, parent_folder, flat_upload):
+    """
+    Upload multiple files from Telegram to Drive with TRUE concurrency
+    
+    Strategy:
+    - Process files in batches of 2
+    - Each batch runs 2 files in PARALLEL using asyncio.gather()
+    """
+    task_id = f"tg_to_drive_{status_msg.chat.id}_{int(time.time())}"
+    
+    task_state = {
+        'successful': 0,
+        'failed': 0,
+        'files': {},
+        'lock': asyncio.Lock(),
+        'cancelled': False
+    }
+    
+    total_files = len(file_list)
+    
+    # Process in batches of 2
+    for i in range(0, total_files, 2):
+        batch = file_list[i:i+2]
+        
+        tasks = [
+            process_one_file_telegram_to_drive(
+                client, service, file_info, task_id, task_state, status_msg, parent_folder, flat_upload
+            )
+            for file_info in batch
+        ]
+        
+        # Run IN PARALLEL!
+        # Both files download from Telegram SIMULTANEOUSLY
+        # Both files upload to Drive SIMULTANEOUSLY
+        await asyncio.gather(*tasks, return_exceptions=True)
+    
+    return task_state['successful'], task_state['failed']
     
     # Update queue status
     if queue_id and queue_id in UPLOAD_QUEUE:
