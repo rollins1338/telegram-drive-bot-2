@@ -1189,13 +1189,17 @@ async def process_one_file_drive_to_telegram(client, service, file_meta, task_id
             os.remove(download_path)
     
     except Exception as e:
+        logger.error(f"❌ Error processing {filename} (Drive→Telegram): {str(e)}", exc_info=True)
         async with task_state['lock']:
             task_state['failed'] += 1
             if filename in task_state['files']:
                 del task_state['files'][filename]
         
         if os.path.exists(download_path):
-            os.remove(download_path)
+            try:
+                os.remove(download_path)
+            except Exception as cleanup_error:
+                logger.error(f"Failed to cleanup {download_path}: {cleanup_error}")
         
         raise
 
@@ -1207,7 +1211,7 @@ async def process_one_file_telegram_to_drive(client, service, file_info, task_id
     This function runs in parallel with other instances via asyncio.gather()
     """
     loop = asyncio.get_event_loop()
-    filename = file_info['name']
+    filename = clean_filename(file_info['name'])  # Clean filename
     msg_id = file_info['msg_id']
     download_path = f"downloads/{filename}"
     
@@ -1323,6 +1327,11 @@ async def process_one_file_telegram_to_drive(client, service, file_info, task_id
         # Wait for upload to complete
         result = await upload_task
         
+        # Update global stats
+        global TOTAL_FILES, TOTAL_BYTES
+        TOTAL_FILES += 1
+        TOTAL_BYTES += os.path.getsize(download_path)
+        
         # Success!
         async with task_state['lock']:
             task_state['successful'] += 1
@@ -1333,13 +1342,17 @@ async def process_one_file_telegram_to_drive(client, service, file_info, task_id
             os.remove(download_path)
     
     except Exception as e:
+        logger.error(f"❌ Error processing {filename} (Telegram→Drive): {str(e)}", exc_info=True)
         async with task_state['lock']:
             task_state['failed'] += 1
             if filename in task_state['files']:
                 del task_state['files'][filename]
         
         if os.path.exists(download_path):
-            os.remove(download_path)
+            try:
+                os.remove(download_path)
+            except Exception as cleanup_error:
+                logger.error(f"Failed to cleanup {download_path}: {cleanup_error}")
         
         raise
 
@@ -1363,10 +1376,52 @@ async def upload_to_telegram_concurrent(client, status_msg, file_list, service):
         'failed': 0,
         'files': {},  # {filename: {stage, progress, current, total, speed, eta}}
         'lock': asyncio.Lock(),
-        'cancelled': False
+        'cancelled': False,
+        'stop_updater': False
     }
     
     total_files = len(file_list)
+    
+    # Status updater task
+    async def status_updater():
+        while not task_state['stop_updater']:
+            async with task_state['lock']:
+                completed = task_state['successful'] + task_state['failed']
+                if completed >= total_files:
+                    break
+                
+                files_status = dict(task_state['files'])
+            
+            if files_status:
+                status_lines = [
+                    f"📤 **Uploading to Telegram**",
+                    f"━━━━━━━━━━━━━━━",
+                    f"📊 Progress: {completed}/{total_files}",
+                    f"✅ Success: {task_state['successful']} | ❌ Failed: {task_state['failed']}",
+                    ""
+                ]
+                
+                for fname, info in files_status.items():
+                    stage_icon = "📥" if info['stage'] == 'downloading_drive' else "📤"
+                    progress_bar = create_progress_bar(info['progress'], length=12)
+                    
+                    status_lines.extend([
+                        f"{stage_icon} `{fname[:40]}...`",
+                        f"{progress_bar}",
+                        f"💾 {format_size(info['current'])} / {format_size(info['total'])}",
+                        f"⚡ {format_size(int(info['speed']))}/s | ⏱️ {format_time(info['eta'])}",
+                        ""
+                    ])
+                
+                try:
+                    await status_msg.edit_text("\n".join(status_lines))
+                except:
+                    pass
+            
+            await asyncio.sleep(1)
+    
+    # Start status updater
+    updater = asyncio.create_task(status_updater())
     
     # Process files in batches of 2 (true parallel execution!)
     for i in range(0, total_files, 2):
@@ -1385,6 +1440,15 @@ async def upload_to_telegram_concurrent(client, status_msg, file_list, service):
         # Both files will upload to Telegram SIMULTANEOUSLY
         await asyncio.gather(*tasks, return_exceptions=True)
     
+    # Stop status updater
+    task_state['stop_updater'] = True
+    try:
+        await asyncio.wait_for(updater, timeout=2.0)
+    except:
+        pass
+    
+    # Final status
+    return task_state['successful'], task_state['failed']
     # Final status
     return task_state['successful'], task_state['failed']
 
@@ -1404,10 +1468,52 @@ async def upload_to_drive_concurrent(client, status_msg, file_list, service, par
         'failed': 0,
         'files': {},
         'lock': asyncio.Lock(),
-        'cancelled': False
+        'cancelled': False,
+        'stop_updater': False
     }
     
     total_files = len(file_list)
+    
+    # Status updater task
+    async def status_updater():
+        while not task_state['stop_updater']:
+            async with task_state['lock']:
+                completed = task_state['successful'] + task_state['failed']
+                if completed >= total_files:
+                    break
+                
+                files_status = dict(task_state['files'])
+            
+            if files_status:
+                status_lines = [
+                    f"☁️ **Uploading to Google Drive**",
+                    f"━━━━━━━━━━━━━━━",
+                    f"📊 Progress: {completed}/{total_files}",
+                    f"✅ Success: {task_state['successful']} | ❌ Failed: {task_state['failed']}",
+                    ""
+                ]
+                
+                for fname, info in files_status.items():
+                    stage_icon = "📥" if info['stage'] == 'downloading_telegram' else "☁️"
+                    progress_bar = create_progress_bar(info['progress'], length=12)
+                    
+                    status_lines.extend([
+                        f"{stage_icon} `{fname[:40]}...`",
+                        f"{progress_bar}",
+                        f"💾 {format_size(info['current'])} / {format_size(info['total'])}",
+                        f"⚡ {format_size(int(info['speed']))}/s | ⏱️ {format_time(info['eta'])}",
+                        ""
+                    ])
+                
+                try:
+                    await status_msg.edit_text("\n".join(status_lines))
+                except:
+                    pass
+            
+            await asyncio.sleep(1)
+    
+    # Start status updater
+    updater = asyncio.create_task(status_updater())
     
     # Process in batches of 2
     for i in range(0, total_files, 2):
@@ -1424,6 +1530,13 @@ async def upload_to_drive_concurrent(client, status_msg, file_list, service, par
         # Both files download from Telegram SIMULTANEOUSLY
         # Both files upload to Drive SIMULTANEOUSLY
         await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Stop status updater
+    task_state['stop_updater'] = True
+    try:
+        await asyncio.wait_for(updater, timeout=2.0)
+    except:
+        pass
     
     return task_state['successful'], task_state['failed']
 
