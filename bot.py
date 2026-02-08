@@ -1231,9 +1231,8 @@ async def download_from_drive_task(client, status_msg, file_ids, service):
                 # IMPORTANT: Check file extensions first for accurate type detection
                 
                 if download_path.lower().endswith(('.mp3', '.m4a', '.m4b', '.flac', '.wav', '.ogg', '.aac', '.opus', '.wma', '.ape')):
-                    # Extract metadata for audio files (run in executor to avoid blocking)
-                    loop = asyncio.get_running_loop()
-                    metadata = await loop.run_in_executor(None, extract_audio_metadata, download_path)
+                    # Extract metadata for audio files
+                    metadata = extract_audio_metadata(download_path)
                     thumbnail_path = await extract_audio_thumbnail(download_path)
                     
                     # Send with metadata
@@ -1585,9 +1584,8 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
                     
                     # Send based on file type
                     if download_path.lower().endswith(('.mp3', '.m4a', '.m4b', '.flac', '.wav', '.ogg', '.aac', '.opus', '.wma', '.ape')):
-                        # Extract metadata for audio files (run in executor to avoid blocking)
-                        loop = asyncio.get_running_loop()
-                        metadata = await loop.run_in_executor(None, extract_audio_metadata, download_path)
+                        # Extract metadata for audio files
+                        metadata = extract_audio_metadata(download_path)
                         thumbnail_path = await extract_audio_thumbnail(download_path)
                         
                         # Send with metadata and progress
@@ -1979,15 +1977,8 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
         
         # MODIFIED: Determine parent folder - use upload_parent instead of DRIVE_FOLDER_ID
         if series_name and not flat_upload:
-            # Create series folder in the selected parent (run in executor)
-            loop = asyncio.get_running_loop()
-            parent_folder = await loop.run_in_executor(
-                None,
-                get_or_create_folder,
-                service,
-                series_name,
-                upload_parent
-            )
+            # Create series folder in the selected parent
+            parent_folder = get_or_create_folder(service, series_name, upload_parent)
             if not parent_folder:
                 await status_msg.edit_text(f"❌ **Failed to create series folder:** {series_name}")
                 if task_id in ACTIVE_TASKS:
@@ -2001,9 +1992,6 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
         
         # Create downloads directory if not exists
         os.makedirs("downloads", exist_ok=True)
-        
-        # Track start time for final stats
-        start_time = time.time()
         
         # Shared state for concurrent workers
         upload_state = {
@@ -2134,15 +2122,7 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
                                 upload_folder = parent_folder
                             else:
                                 folder_name = os.path.splitext(clean_name)[0]
-                                # Run folder creation in executor to avoid blocking
-                                loop = asyncio.get_running_loop()
-                                file_folder = await loop.run_in_executor(
-                                    None, 
-                                    get_or_create_folder, 
-                                    service, 
-                                    folder_name, 
-                                    parent_folder
-                                )
+                                file_folder = get_or_create_folder(service, folder_name, parent_folder)
                                 
                                 if not file_folder:
                                     raise Exception("Failed to create file folder")
