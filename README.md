@@ -1,82 +1,255 @@
-# RxUploader Bot
+# RxUploader
 
-A Telegram bot for seamless Google Drive integration with advanced file management, progress tracking, and queue system.
+Telegram bot. Google Drive integration. No bullshit.
 
-[![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+## What It Does
+
+**Upload**: Send files to Telegram. Bot dumps them to Drive.  
+**Download**: Paste Drive link. Bot sends files back.  
+**Browse**: Navigate your Drive from Telegram.
+
+That's it.
 
 ## Features
 
-### Upload to Drive
-- Automatic file upload from Telegram to Google Drive
-- Intelligent series detection and folder organization
-- Real-time progress tracking with speed and ETA
-- Queue management with priority and retry support
-- Batch upload with album handling
+- Real-time progress bars (speed, ETA, all that)
+- Queue system (upload multiple files, bot handles it)
+- Series detection (sends "Breaking.Bad.S01E01.mkv" â†’ creates "Breaking Bad" folder)
+- File filtering (only uploads audio/video, ignores junk)
+- Cancel anytime (button or `/cancel`)
+- Auto-retry on failure (3 attempts max)
+- Filename cleaning (replaces underscores with spaces)
 
-### Download from Drive
-- Send Drive links to download files directly to Telegram
-- Support for single files and entire folder downloads
-- Interactive file browser with pagination
-- Search functionality and favorites system
-- Multi-select file operations
+## Requirements
 
-### Progress Tracking
-- Visual progress bars for all operations
-- Real-time upload/download speed monitoring
-- Accurate ETA calculations
-- Two-phase tracking (Drive to Bot, Bot to Telegram)
-
-## Installation
-
-### Prerequisites
-- Python 3.8 or higher
-- Google Cloud Project with Drive API enabled
-- Telegram Bot Token
-
-### Setup
-
-1. Clone the repository
-```bash
-git clone https://github.com/rollins1338/telegram-drive-bot-2.git
-cd rxuploader-bot
+```
+Python 3.8+
+Telegram API credentials
+Google Drive API access
 ```
 
-2. Install dependencies
+## Install
+
 ```bash
+git clone https://github.com/rollins1338/telegram-drive-bot-2.git
+cd telegram-drive-bot-2
 pip install -r requirements.txt
 ```
 
-3. Configure environment variables
-```bash
-cp .env.example .env
-```
+## Configure
 
-Edit `.env` with your credentials:
+Create `.env`:
+
 ```env
-API_ID=your_telegram_api_id
-API_HASH=your_telegram_api_hash
-TELEGRAM_TOKEN=your_bot_token
+API_ID=your_api_id
+API_HASH=your_api_hash
+TELEGRAM_TOKEN=bot_token_from_botfather
 OWNER_ID=your_telegram_user_id
-DRIVE_FOLDER_ID=your_drive_folder_id
-TOKEN_JSON='{"token": "...", "refresh_token": "...", ...}'
+DRIVE_FOLDER_ID=target_drive_folder
+TOKEN_JSON='{"token":"...","refresh_token":"...","client_id":"...","client_secret":"...","scopes":["https://www.googleapis.com/auth/drive.file"]}'
 ```
 
-4. Run the bot
+**Get credentials:**
+- Telegram: [my.telegram.org](https://my.telegram.org)
+- Bot token: [@BotFather](https://t.me/botfather)
+- User ID: [@userinfobot](https://t.me/userinfobot)
+- Drive: [Google Cloud Console](https://console.cloud.google.com/) â†’ Enable Drive API â†’ OAuth credentials
+
+## Run
+
 ```bash
 python bot.py
 ```
 
-## Getting Credentials
+Health check runs on port 8000.
 
-### Telegram Credentials
-1. Get `API_ID` and `API_HASH` from [my.telegram.org](https://my.telegram.org)
-2. Create a bot via [@BotFather](https://t.me/botfather) to get `TELEGRAM_TOKEN`
-3. Get your `OWNER_ID` from [@userinfobot](https://t.me/userinfobot)
+## Commands
 
-### Google Drive Credentials
-1. Go to [Google Cloud Console](https://console.cloud.google.com/)
-2. Create a new project or select existing
+```
+/start      - Wake up
+/stats      - Numbers
+/queue      - What's waiting
+/browse     - Navigate Drive
+/search     - Find files
+/cancel     - Stop everything
+/retry      - Retry failures
+```
+
+## How It Works
+
+**Upload Flow:**
+1. Send file to bot
+2. Bot asks: Series? Standalone? Root?
+3. Downloads from Telegram
+4. Uploads to Drive
+5. Done
+
+**Download Flow:**
+1. Paste Drive link
+2. Bot shows files/folders
+3. Select what you want
+4. Bot downloads from Drive
+5. Sends to Telegram
+6. Done
+
+**Progress Tracking:**
+- Shows download speed (Telegram â†’ Bot)
+- Shows upload speed (Bot â†’ Drive)
+- Real-time ETA calculations
+- Cancel button on every operation
+
+## File Handling
+
+Bot only processes **audio and video files**. Everything else gets skipped.
+
+Supported formats:
+- Audio: mp3, m4a, m4b, flac, wav, aac, ogg, opus
+- Video: mp4, mkv, avi, mov, wmv, flv, webm
+
+## Deploy
+
+**Local:**
+```bash
+python bot.py
+```
+
+**Docker:**
+```bash
+docker build -t rxuploader .
+docker run -d --env-file .env rxuploader
+```
+
+**Koyeb/VPS:**
+- Set environment variables
+- Point to GitHub repo
+- Deploy
+- Health check: `http://your-host:8000`
+
+## Security
+
+- Owner ID verification on all commands
+- No public access
+- Environment variables only
+- Never commit: `.env`, `token.json`, `*.session`
+
+## Troubleshooting
+
+**Bot doesn't respond:**
+- Check `TELEGRAM_TOKEN`
+- Verify `OWNER_ID` is correct
+
+**Drive errors:**
+- Check `TOKEN_JSON` scopes
+- Enable Drive API in Cloud Console
+- Verify folder permissions
+
+**Upload fails:**
+- Check Drive storage quota
+- Verify file size limits
+
+## Tech Stack
+
+- Pyrogram (Telegram API)
+- Google Drive API v3
+- Python 3.8+
+
+## License
+
+MIT. Do whatever.
+
+## Notes
+
+- Bot is single-user (owner only)
+- Health check server runs on port 8000
+- Files filtered: only audio/video uploaded
+- Queue system handles concurrent uploads
+- Auto-retry on failures (max 3 attempts)
+- Progress updates every 2 seconds (avoids flood limits)
+
+---
+
+Built for personal use. Don't abuse it.3. Select what you want
+4. Bot downloads from Drive
+5. Sends to Telegram
+6. Done
+
+**Progress Tracking:**
+- Shows download speed (Telegram â†’ Bot)
+- Shows upload speed (Bot â†’ Drive)
+- Real-time ETA calculations
+- Cancel button on every operation
+
+## File Handling
+
+Bot only processes **audio and video files**. Everything else gets skipped.
+
+Supported formats:
+- Audio: mp3, m4a, m4b, flac, wav, aac, ogg, opus
+- Video: mp4, mkv, avi, mov, wmv, flv, webm
+
+## Deploy
+
+**Local:**
+```bash
+python bot.py
+```
+
+**Docker:**
+```bash
+docker build -t rxuploader .
+docker run -d --env-file .env rxuploader
+```
+
+**Koyeb/VPS:**
+- Set environment variables
+- Point to GitHub repo
+- Deploy
+- Health check: `http://your-host:8000`
+
+## Security
+
+- Owner ID verification on all commands
+- No public access
+- Environment variables only
+- Never commit: `.env`, `token.json`, `*.session`
+
+## Troubleshooting
+
+**Bot doesn't respond:**
+- Check `TELEGRAM_TOKEN`
+- Verify `OWNER_ID` is correct
+
+**Drive errors:**
+- Check `TOKEN_JSON` scopes
+- Enable Drive API in Cloud Console
+- Verify folder permissions
+
+**Upload fails:**
+- Check Drive storage quota
+- Verify file size limits
+
+## Tech Stack
+
+- Pyrogram (Telegram API)
+- Google Drive API v3
+- Python 3.8+
+
+## License
+
+MIT. Do whatever.
+
+## Notes
+
+- Bot is single-user (owner only)
+- Health check server runs on port 8000
+- Files filtered: only audio/video uploaded
+- Queue system handles concurrent uploads
+- Auto-retry on failures (max 3 attempts)
+- Progress updates every 2 seconds (avoids flood limits)
+
+---
+
+Built for personal use. Don't abuse it.2. Create a new project or select existing
 3. Enable Google Drive API
 4. Create OAuth 2.0 credentials (Desktop app)
 5. Download credentials and generate `TOKEN_JSON` with required scopes:
