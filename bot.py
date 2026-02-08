@@ -1430,6 +1430,7 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
                             return
         
                         status, done = downloader.next_chunk()
+                        await asyncio.sleep(0)
         
                         # Show progress bar for Drive download with speed and ETA
                         if status:
