@@ -9,7 +9,7 @@ import re
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, MessageNotModified
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload, MediaIoBaseUpload
@@ -705,11 +705,18 @@ def get_browser_session(user_id):
 def format_file_item(file_info, selected=False):
     """Format file information for display"""
     name = file_info['name']
-    size = format_size(int(file_info.get('size', 0))) if 'size' in file_info else 'N/A'
+    
+    # FIXED: Only show size for files, not folders
+    mime = file_info.get('mimeType', '')
+    is_folder = mime == 'application/vnd.google-apps.folder'
+    
+    if is_folder:
+        size = ''  # No size for folders
+    else:
+        size = format_size(int(file_info.get('size', 0))) if 'size' in file_info else 'N/A'
     
     # Get file type emoji
-    mime = file_info.get('mimeType', '')
-    if 'folder' in mime:
+    if is_folder:
         emoji = '📁'
     elif 'video' in mime:
         emoji = '🎬'
@@ -756,8 +763,8 @@ def build_browser_keyboard(user_id, folders, files, total_items):
         is_folder = item['mimeType'] == 'application/vnd.google-apps.folder'
         is_selected = item['id'] in selected
         
-        # Get formatted display name and size
-        name, size, _ = format_file_item(item, is_selected)
+        # Get formatted display name and size (already includes emoji)
+        formatted_name, size, _ = format_file_item(item, is_selected)
         
         # Selection checkbox with clear visual states
         if is_selected:
@@ -765,38 +772,20 @@ def build_browser_keyboard(user_id, folders, files, total_items):
         else:
             checkbox = "☐"  # Empty box for unselected
         
-        # Icon based on type
-        if is_folder:
-            icon = "📁"
-        else:
-            # Determine icon by mime type or extension
-            mime = item.get('mimeType', '')
-            if 'video' in mime:
-                icon = "🎬"
-            elif 'audio' in mime or 'music' in mime:
-                icon = "🎵"
-            elif 'image' in mime:
-                icon = "🖼️"
-            elif 'pdf' in mime:
-                icon = "📄"
-            else:
-                icon = "📄"
-        
-        # Truncate name to fit better
-        display_name = name[:30] + "..." if len(name) > 30 else name
+        # Truncate name to fit better (name already has emoji from format_file_item)
+        display_name = formatted_name[:40] + "..." if len(formatted_name) > 40 else formatted_name
         
         if is_folder:
-            # Folders: checkbox + name with icon + open button
+            # Folders: checkbox + name (with emoji) + open button (no size)
             keyboard.append([
                 InlineKeyboardButton(checkbox, callback_data=f"browser_select|{item['id']}"),
-                InlineKeyboardButton(f"{icon} {display_name}", callback_data=f"browser_open|{item['id']}"),
-                InlineKeyboardButton(f"💾 {size}", callback_data=f"browser_info|{item['id']}")
+                InlineKeyboardButton(display_name, callback_data=f"browser_open|{item['id']}")
             ])
         else:
-            # Files: checkbox + name with icon + size
+            # Files: checkbox + name (with emoji) + size
             keyboard.append([
                 InlineKeyboardButton(checkbox, callback_data=f"browser_select|{item['id']}"),
-                InlineKeyboardButton(f"{icon} {display_name}", callback_data=f"browser_info|{item['id']}"),
+                InlineKeyboardButton(display_name, callback_data=f"browser_info|{item['id']}"),
                 InlineKeyboardButton(f"💾 {size}", callback_data=f"browser_info|{item['id']}")
             ])
     
@@ -841,17 +830,17 @@ def build_browser_keyboard(user_id, folders, files, total_items):
         
         keyboard.append(selection_row)
     else:
-        # NEW: Show "Select All" when nothing is selected
+        # MERGED: Single "Select All" button - selects EVERYTHING (files + folders)
         if total_items > 0:
             keyboard.append([
-                InlineKeyboardButton("☑️ Select All on Page", callback_data="browser_select_page"),
-                InlineKeyboardButton("☑️ Select All Files", callback_data="browser_select_all_files")
+                InlineKeyboardButton("☑️ Select All", callback_data="browser_select_all")
             ])
     
     # Utility row
     utility_row = []
     utility_row.append(InlineKeyboardButton("🔍 Search", callback_data="browser_search"))
     utility_row.append(InlineKeyboardButton("🔄 Refresh", callback_data="browser_refresh"))
+    utility_row.append(InlineKeyboardButton("❌ Close", callback_data="browser_close"))
     
     keyboard.append(utility_row)
     
@@ -918,6 +907,22 @@ def get_breadcrumb(session):
     """Get breadcrumb navigation path"""
     path_parts = [p['name'] for p in session['path']]
     return " > ".join(path_parts)
+
+async def safe_edit_message(message, text, reply_markup=None):
+    """
+    Safely edit a message, handling MessageNotModified errors
+    """
+    try:
+        if reply_markup:
+            await message.edit_text(text, reply_markup=reply_markup)
+        else:
+            await message.edit_text(text)
+    except MessageNotModified:
+        # Message content is the same, silently ignore
+        pass
+    except Exception as e:
+        logger.error(f"Error editing message: {e}")
+        raise
 
 def create_progress_bar(progress, length=10):
     """
@@ -2871,14 +2876,15 @@ async def handle_callback(client, query):
                 # Quick answer without alert
                 await query.answer(f"✅ {action}", show_alert=False)
                 
-                # Optimized refresh - handle FloodWait gracefully
+                # Optimized refresh - handle FloodWait and MessageNotModified gracefully
                 try:
                     folders, files, _ = list_drive_files(service, session['current_folder'])
                     total_items = len(folders) + len(files)
                     keyboard = build_browser_keyboard(user_id, folders, files, total_items)
                     breadcrumb = get_breadcrumb(session)
                     
-                    await query.message.edit_text(
+                    await safe_edit_message(
+                        query.message,
                         f"📁 **File Browser**\n"
                         f"📍 {breadcrumb}\n"
                         f"📊 {len(folders)} folders, {len(files)} files\n"
@@ -3056,17 +3062,13 @@ async def handle_callback(client, query):
                 await query.answer("✅ Selection cleared", show_alert=False)
             
             # NEW: Select all files on current page
-            elif query.data == "browser_select_page":
+            # MERGED: Select ALL items (files + folders) in current folder
+            elif query.data == "browser_select_all":
                 folders, files, _ = list_drive_files(service, session['current_folder'])
-                page = session.get('page', 0)
-                start_idx = page * ITEMS_PER_PAGE
-                end_idx = start_idx + ITEMS_PER_PAGE
                 
+                # Select EVERYTHING - both files and folders
                 all_items = folders + files
-                page_items = all_items[start_idx:end_idx]
-                
-                # Add all items on page to selection
-                for item in page_items:
+                for item in all_items:
                     if item['id'] not in session['selected_files']:
                         session['selected_files'].append(item['id'])
                 
@@ -3074,34 +3076,14 @@ async def handle_callback(client, query):
                 keyboard = build_browser_keyboard(user_id, folders, files, total_items)
                 breadcrumb = get_breadcrumb(session)
                 
-                await query.message.edit_text(
+                await safe_edit_message(
+                    query.message,
                     f"📁 **File Browser**\n"
                     f"📍 {breadcrumb}\n"
                     f"📊 {len(folders)} folders, {len(files)} files",
                     reply_markup=keyboard
                 )
-                await query.answer(f"✅ Selected {len(page_items)} items", show_alert=False)
-            
-            # NEW: Select all files (only files, not folders) in current folder
-            elif query.data == "browser_select_all_files":
-                folders, files, _ = list_drive_files(service, session['current_folder'])
-                
-                # Add all files (not folders) to selection
-                for file in files:
-                    if file['id'] not in session['selected_files']:
-                        session['selected_files'].append(file['id'])
-                
-                total_items = len(folders) + len(files)
-                keyboard = build_browser_keyboard(user_id, folders, files, total_items)
-                breadcrumb = get_breadcrumb(session)
-                
-                await query.message.edit_text(
-                    f"📁 **File Browser**\n"
-                    f"📍 {breadcrumb}\n"
-                    f"📊 {len(folders)} folders, {len(files)} files",
-                    reply_markup=keyboard
-                )
-                await query.answer(f"✅ Selected {len(files)} files", show_alert=False)
+                await query.answer(f"✅ Selected {len(all_items)} items", show_alert=False)
             
             # Back button
             elif query.data == "browser_back":
@@ -3209,6 +3191,18 @@ async def handle_callback(client, query):
             # Search button
             elif query.data == "browser_search":
                 await query.answer("🔍 Use /search <query> command", show_alert=True)
+            
+            # Close browser
+            elif query.data == "browser_close":
+                # Clean up session
+                if user_id in BROWSER_SESSIONS:
+                    del BROWSER_SESSIONS[user_id]
+                
+                await query.message.edit_text(
+                    "✅ **Browser Closed**\n\n"
+                    "Use /browse to open again."
+                )
+                await query.answer("Browser closed", show_alert=False)
             
             return
         
@@ -3883,9 +3877,19 @@ async def handle_callback(client, query):
         
         await query.answer()
     
+    except MessageNotModified:
+        # Message content is the same, just answer the callback
+        await query.answer()
     except Exception as e:
-        logger.error(f"Callback error: {e}")
-        await query.answer(f"Error: {str(e)}", show_alert=True)
+        logger.error(f"Callback error: {str(e)}")
+        logger.error(f"Callback data: {query.data}")
+        logger.error(f"User: {query.from_user.id}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        try:
+            await query.answer(f"❌ Error: {str(e)}", show_alert=True)
+        except:
+            pass  # If we can't answer, just log
 
 @app.on_message(filters.text & filters.user(OWNER_ID) & ~filters.command(["start", "stats", "cancel", "queue", "status", "retry", "clearfailed"]))
 async def handle_text(client, message: Message):
