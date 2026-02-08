@@ -16,6 +16,13 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload, MediaIoBa
 from googleapiclient.errors import HttpError
 import logging
 
+# Configure logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
 # Import mutagen for audio metadata extraction
 try:
     from mutagen import File as MutagenFile
@@ -26,13 +33,6 @@ try:
 except ImportError:
     MUTAGEN_AVAILABLE = False
     logger.warning("⚠️ Mutagen not installed - audio metadata will not be preserved")
-
-# Configure logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
 
 # ==================== HEALTH CHECK SERVER ====================
 # Ultra-minimal health check (Koyeb-tested and working)
@@ -998,7 +998,10 @@ def extract_audio_metadata(file_path):
         
         # Album
         if 'album' in audio:
-            metadata['album'] = str(audio['album'][0]) if isinstance(audio['album'], list) else str(audio['album'])
+            if isinstance(audio['album'], list) and len(audio['album']) > 0:
+                metadata['album'] = str(audio['album'][0])
+            else:
+                metadata['album'] = str(audio['album'])
         
         # Duration
         if hasattr(audio.info, 'length'):
@@ -1040,7 +1043,10 @@ async def extract_audio_thumbnail(file_path):
                     thumb_data = pics[0].data
             # MP4/M4A
             elif 'covr' in audio.tags:
-                thumb_data = bytes(audio.tags['covr'][0])
+                if isinstance(audio.tags['covr'], list) and len(audio.tags['covr']) > 0:
+                    thumb_data = bytes(audio.tags['covr'][0])
+                else:
+                    thumb_data = bytes(audio.tags['covr'])
         
         # Save thumbnail if found
         if thumb_data:
@@ -1109,87 +1115,92 @@ async def download_from_drive_task(client, status_msg, file_ids, service):
                     f"✅ {successful} | ❌ {failed}"
                 )
                 
-                # Download file from Drive
-                request = service.files().get_media(fileId=file_id)
+                # Download file from Drive using robust worker logic
                 download_path = f"downloads/{filename}"
-                
                 os.makedirs("downloads", exist_ok=True)
                 
-                fh = io.FileIO(download_path, 'wb')
-                downloader = MediaIoBaseDownload(fh, request)
-                
-                done = False
-                last_update = 0  # Track last update time to avoid FloodWait
-                start_time = time.time()  # Track download start time for speed/ETA
-                last_progress_bytes = 0  # Track bytes for speed calculation
-                last_speed_update = start_time  # Track last speed update time
-                
-                while not done:
-                    # Check for cancellation
+                progress_state = {
+                    "done": False,
+                    "error": None,
+                    "pct": 0,
+                    "bytes": 0,
+                    "speed": 0.0,
+                    "eta": "Calculating...",
+                }
+
+                def _drive_download_worker():
+                    try:
+                        svc = get_drive_service()
+                        if not svc:
+                            raise Exception("Failed to connect to Google Drive")
+                        req = svc.files().get_media(fileId=file_id)
+                        with io.FileIO(download_path, "wb") as fh:
+                            downloader = MediaIoBaseDownload(fh, req)
+                            done_local = False
+                            last_t = time.time()
+                            last_b = 0
+                            while not done_local:
+                                if ACTIVE_TASKS.get(task_id, {}).get("cancelled", False):
+                                    raise Exception("Cancelled")
+                                status, done_local = downloader.next_chunk()
+                                if status and file_size:
+                                    pct = int(status.progress() * 100)
+                                    cur_b = int(status.progress() * file_size)
+                                    now = time.time()
+                                    dt = max(now - last_t, 1e-6)
+                                    db = cur_b - last_b
+                                    spd = db / dt
+                                    progress_state["pct"] = pct
+                                    progress_state["bytes"] = cur_b
+                                    progress_state["speed"] = spd
+                                    if spd > 0 and cur_b < file_size:
+                                        progress_state["eta"] = format_time((file_size - cur_b) / spd)
+                                    else:
+                                        progress_state["eta"] = "Done" if cur_b >= file_size else "Calculating..."
+                                    last_t = now
+                                    last_b = cur_b
+                        progress_state["done"] = True
+                    except Exception as e:
+                        progress_state["error"] = str(e)
+                        progress_state["done"] = True
+
+                loop = asyncio.get_running_loop()
+                download_future = loop.run_in_executor(None, _drive_download_worker)
+
+                last_update = 0.0
+                while not progress_state["done"]:
                     if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
-                        fh.close()
-                        if os.path.exists(download_path):
-                            os.remove(download_path)
-                        await status_msg.edit_text(
-                            f"🛑 **Download Cancelled**\n\n"
-                            f"✅ Downloaded: {successful}/{total_files}\n"
-                            f"❌ Failed: {failed}"
-                        )
-                        return
-                    
-                    status, done = downloader.next_chunk()
-                    
-                    # Update progress with visual bar, speed, and ETA
-                    if status:
-                        progress = int(status.progress() * 100)
-                        current_bytes = int(status.progress() * file_size)
-                        current_time = time.time()
-                        
-                        # Only update every 3 seconds to avoid FloodWait
-                        if current_time - last_update >= 3 or done:
-                            # Calculate speed (bytes per second)
-                            time_diff = current_time - last_speed_update
-                            bytes_diff = current_bytes - last_progress_bytes
-                            
-                            if time_diff > 0:
-                                speed = bytes_diff / time_diff  # bytes per second
-                            else:
-                                speed = 0
-                            
-                            # Calculate ETA
-                            if speed > 0 and current_bytes < file_size:
-                                remaining_bytes = file_size - current_bytes
-                                eta_seconds = remaining_bytes / speed
-                                eta_str = format_time(eta_seconds)
-                            else:
-                                eta_str = "Calculating..." if current_bytes < file_size else "Done"
-                            
-                            # Update tracking variables
-                            last_update = current_time
-                            last_speed_update = current_time
-                            last_progress_bytes = current_bytes
-                            
-                            progress_bar = create_progress_bar(progress, length=12)
-                            
-                            try:
-                                await status_msg.edit_text(
-                                    f"📥 **Downloading from Drive ({idx}/{total_files})**\n"
-                                    f"📄 `{filename[:45]}...`\n"
-                                    f"💾 Size: {format_size(file_size)}\n\n"
-                                    f"{progress_bar}\n"
-                                    f"⚡ Speed: {format_size(speed)}/s\n"
-                                    f"⏱️ ETA: {eta_str}\n\n"
-                                    f"✅ {successful} | ❌ {failed}"
-                                )
-                            except FloodWait as e:
-                                logger.warning(f"FloodWait during download: {e.value}s")
-                                await asyncio.sleep(e.value)
-                            except Exception as e:
-                                # Ignore other update errors to avoid breaking download
-                                logger.debug(f"Status update error (non-critical): {e}")
-                                pass
-                
-                fh.close()
+                        break
+                    now = time.time()
+                    if now - last_update >= 3.0: # Match 3s throttle
+                        last_update = now
+                        progress = int(progress_state.get("pct", 0) or 0)
+                        current_bytes = int(progress_state.get("bytes", 0) or 0)
+                        drive_speed = float(progress_state.get("speed", 0.0) or 0.0)
+                        eta_str = progress_state.get("eta", "Calculating...")
+                        progress_bar = create_progress_bar(progress, length=12)
+
+                        try:
+                            await status_msg.edit_text(
+                                f"📥 **Downloading from Drive ({idx}/{total_files})**\n"
+                                f"📄 `{filename[:45]}...`\n"
+                                f"💾 {format_size(current_bytes)} / {format_size(file_size)}\n\n"
+                                f"{progress_bar}\n"
+                                f"⚡ Speed: {format_size(drive_speed)}/s\n"
+                                f"⏱️ ETA: {eta_str}\n\n"
+                                f"✅ {successful} | ❌ {failed}"
+                            )
+                        except FloodWait as e:
+                            await asyncio.sleep(float(str(e.value)))
+                        except Exception:
+                            pass
+                    await asyncio.sleep(0.5)
+
+                await download_future
+                if progress_state.get("error"):
+                    if os.path.exists(download_path):
+                        os.remove(download_path)
+                    raise Exception(progress_state["error"])
                 
                 # Send to Telegram
                 await status_msg.edit_text(
@@ -1373,6 +1384,7 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
         semaphore = DRIVE_TO_TG_SEMAPHORE
 
         async def _run_one(idx, file_meta):
+            nonlocal successful, failed
             async with semaphore:
                 # Check for cancellation
                 if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
@@ -1405,89 +1417,107 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
                         f"✅ {successful} | ❌ {failed}"
                     )
     
-                    await status_msg.edit_text(status_text)
+                    try:
+                        await status_msg.edit_text(status_text)
+                    except Exception as e:
+                        logger.debug(f"Initial status update error: {e}")
     
                     # Download file from Drive with progress bar
                     request = service.files().get_media(fileId=file_id)
                     download_path = f"downloads/{filename}"
-    
                     os.makedirs("downloads", exist_ok=True)
-    
-                    fh = io.FileIO(download_path, 'wb')
-                    downloader = MediaIoBaseDownload(fh, request)
-    
-                    done = False
-                    last_update = 0
-                    drive_start_time = time.time()  # Track download start time for speed/ETA
-                    last_drive_bytes = 0  # Track bytes for speed calculation
-                    last_drive_speed_update = drive_start_time  # Track last speed update time
-    
-                    while not done:
+
+                    progress_state = {
+                        "done": False,
+                        "error": None,
+                        "pct": 0,
+                        "bytes": 0,
+                        "speed": 0.0,
+                        "eta": "Calculating...",
+                    }
+
+                    def _drive_download_worker():
+                        try:
+                            svc = get_drive_service()
+                            if not svc:
+                                raise Exception("Failed to connect to Google Drive")
+                            req = svc.files().get_media(fileId=file_id)
+                            with io.FileIO(download_path, "wb") as fh:
+                                downloader = MediaIoBaseDownload(fh, req)
+                                done_local = False
+                                last_t = time.time()
+                                last_b = 0
+                                while not done_local:
+                                    if ACTIVE_TASKS.get(task_id, {}).get("cancelled", False):
+                                        raise Exception("Cancelled")
+                                    status, done_local = downloader.next_chunk()
+                                    if status and file_size:
+                                        pct = int(status.progress() * 100)
+                                        cur_b = int(status.progress() * file_size)
+                                        now = time.time()
+                                        dt = max(now - last_t, 1e-6)
+                                        db = cur_b - last_b
+                                        spd = db / dt
+                                        progress_state["pct"] = pct
+                                        progress_state["bytes"] = cur_b
+                                        progress_state["speed"] = spd
+                                        if spd > 0 and cur_b < file_size:
+                                            progress_state["eta"] = format_time((file_size - cur_b) / spd)
+                                        else:
+                                            progress_state["eta"] = "Done" if cur_b >= file_size else "Calculating..."
+                                        last_t = now
+                                        last_b = cur_b
+                            progress_state["done"] = True
+                        except Exception as e:
+                            progress_state["error"] = str(e)
+                            progress_state["done"] = True
+
+                    loop = asyncio.get_running_loop()
+                    download_future = loop.run_in_executor(None, _drive_download_worker)
+
+                    last_update = 0.0
+                    while not progress_state["done"]:
                         if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
-                            fh.close()
+                            break
+                        now = time.time()
+                        if now - last_update >= 1.0:
+                            last_update = now
+                            progress = int(progress_state.get("pct", 0) or 0)
+                            current_bytes = int(progress_state.get("bytes", 0) or 0)
+                            drive_speed = float(progress_state.get("speed", 0.0) or 0.0)
+                            eta_str = progress_state.get("eta", "Calculating...")
+                            progress_bar = create_progress_bar(progress, length=12)
+
+                            drive_status = (f"📥 **Downloading from Drive ({idx}/{total_files})**\n")
+                            if folder_name:
+                                drive_status += f"📁 Folder: {folder_name}\n"
+                            drive_status += (
+                                f"📄 `{filename[:45]}...`\n"
+                                f"💾 {format_size(current_bytes)} / {format_size(file_size)}\n\n"
+                                f"{progress_bar}\n"
+                                f"⚡ Speed: {format_size(drive_speed)}/s\n"
+                                f"⏱️ ETA: {eta_str}\n\n"
+                                f"✅ {successful} | ❌ {failed}"
+                            )
+
+                            try:
+                                await status_msg.edit_text(drive_status)
+                            except FloodWait as e:
+                                await asyncio.sleep(float(str(e.value)))
+                            except Exception:
+                                pass
+                        await asyncio.sleep(0.2)
+
+                    await download_future
+
+                    if progress_state.get("error"):
+                        try:
                             if os.path.exists(download_path):
                                 os.remove(download_path)
-                            return
-        
-                        status, done = downloader.next_chunk()
-                        await asyncio.sleep(0)
-        
-                        # Show progress bar for Drive download with speed and ETA
-                        if status:
-                            progress = int(status.progress() * 100)
-                            current_bytes = int(status.progress() * file_size)
-                            current_time = time.time()
-            
-                            # Update every 3 seconds to avoid FloodWait
-                            if current_time - last_update >= 3 or done:
-                                # Calculate speed (bytes per second)
-                                time_diff = current_time - last_drive_speed_update
-                                bytes_diff = current_bytes - last_drive_bytes
-                
-                                if time_diff > 0:
-                                    drive_speed = bytes_diff / time_diff  # bytes per second
-                                else:
-                                    drive_speed = 0
-                
-                                # Calculate ETA
-                                if drive_speed > 0 and current_bytes < file_size:
-                                    remaining_bytes = file_size - current_bytes
-                                    eta_seconds = remaining_bytes / drive_speed
-                                    eta_str = format_time(eta_seconds)
-                                else:
-                                    eta_str = "Calculating..." if current_bytes < file_size else "Done"
-                
-                                # Update tracking variables
-                                last_update = current_time
-                                last_drive_speed_update = current_time
-                                last_drive_bytes = current_bytes
-                
-                                progress_bar = create_progress_bar(progress, length=12)
-                
-                                drive_status = (
-                                    f"📥 **Downloading from Drive ({idx}/{total_files})**\n"
-                                )
-                                if folder_name:
-                                    drive_status += f"📁 Folder: {folder_name}\n"
-                                drive_status += (
-                                    f"📄 `{filename[:45]}...`\n"
-                                    f"💾 Size: {format_size(file_size)}\n\n"
-                                    f"{progress_bar}\n"
-                                    f"⚡ Speed: {format_size(drive_speed)}/s\n"
-                                    f"⏱️ ETA: {eta_str}\n\n"
-                                    f"✅ {successful} | ❌ {failed}"
-                                )
-                
-                                try:
-                                    await status_msg.edit_text(drive_status)
-                                except FloodWait as e:
-                                    logger.warning(f"FloodWait during Drive download: {e.value}s")
-                                    await asyncio.sleep(e.value)
-                                except Exception as e:
-                                    logger.debug(f"Status update error (non-critical): {e}")
-    
-                    fh.close()
-    
+                        except Exception:
+                            pass
+                        raise Exception(progress_state["error"])
+
                     # Send to Telegram with progress callback
                     # Prepare caption based on file type and folder context
                     mime_type = file_meta.get('mimeType', '')
@@ -1548,7 +1578,7 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
                                 await status_msg.edit_text(upload_status)
                             except FloodWait as e:
                                 logger.warning(f"FloodWait during upload: {e.value}s")
-                                await asyncio.sleep(e.value)
+                                await asyncio.sleep(float(str(e.value)))
                             except Exception as e:
                                 logger.debug(f"Upload progress update error (non-critical): {e}")
     
@@ -1608,7 +1638,10 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
                     logger.info(f"✅ Uploaded to Telegram: {filename}")
     
                 except Exception as e:
-                    logger.error(f"❌ Error uploading {filename}: {e}")
+                    # Access filename from local scope if defined, else from file_meta
+                    # Access name from file_meta to avoid UnboundLocalError
+                    f_name = file_meta.get('name', 'Unknown')
+                    logger.error(f"❌ Error uploading {f_name}: {e}")
                     failed += 1
         
 
