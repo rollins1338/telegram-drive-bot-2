@@ -105,6 +105,7 @@ RETRY_DELAY = 5  # seconds
 # File Browser State
 BROWSER_SESSIONS = {}  # Format: {user_id: {'current_folder': str, 'path': [], 'selected_files': [], 'page': int}}
 DOWNLOAD_QUEUE = {}  # Format: {task_id: {'files': [], 'status': str, 'progress': int}}
+FOLDER_SUBFOLDER_CACHE = {}  # Cache for folder subfolder status: {folder_id: bool}
 
 # NEW: Folder selection for uploads
 PENDING_FOLDER_SELECTION = {}  # Format: {user_id: {'file_list': [], 'series_name': str, 'mode': str, 'flat_upload': bool}}
@@ -705,30 +706,34 @@ def get_browser_session(user_id):
 def format_file_item(file_info, selected=False):
     """Format file information for display"""
     name = file_info['name']
-    size = format_size(int(file_info.get('size', 0))) if 'size' in file_info else 'N/A'
-    
-    # Get file type emoji
-    mime = file_info.get('mimeType', '')
-    if 'folder' in mime:
-        emoji = '📁'
-    elif 'video' in mime:
-        emoji = '🎬'
-    elif 'audio' in mime:
-        emoji = '🎵'
-    elif 'image' in mime:
-        emoji = '🖼️'
-    elif 'pdf' in mime:
-        emoji = '📄'
-    elif 'document' in mime or 'text' in mime:
-        emoji = '📝'
-    else:
-        emoji = '📎'
+    size = format_size(int(file_info.get('size', 0))) if 'size' in file_info else ''
     
     checkbox = '✅' if selected else '☑️'
     
-    return f"{emoji} {name[:35]}..." if len(name) > 35 else f"{emoji} {name}", size, checkbox
+    # Return just the name without emoji (emoji will be added in keyboard builder)
+    return name, size, checkbox
 
-def build_browser_keyboard(user_id, folders, files, total_items):
+def has_subfolders(service, folder_id):
+    """Check if a folder contains subfolders (with caching)"""
+    if folder_id in FOLDER_SUBFOLDER_CACHE:
+        return FOLDER_SUBFOLDER_CACHE[folder_id]
+    
+    try:
+        # Quick check - just look for any folder in the first page
+        query = f"'{folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+        results = service.files().list(
+            q=query,
+            pageSize=1,
+            fields="files(id)"
+        ).execute()
+        
+        has_folders = len(results.get('files', [])) > 0
+        FOLDER_SUBFOLDER_CACHE[folder_id] = has_folders
+        return has_folders
+    except:
+        return False
+
+def build_browser_keyboard(user_id, folders, files, total_items, service=None):
     """
     Build inline keyboard for file browser with improved pagination and selection logic
     Features: Better visual feedback, cleaner pagination, organized button layout
@@ -767,14 +772,18 @@ def build_browser_keyboard(user_id, folders, files, total_items):
         
         # Icon based on type
         if is_folder:
-            icon = "📁"
+            # Check if folder has subfolders
+            if service and has_subfolders(service, item['id']):
+                icon = "📁 📁"
+            else:
+                icon = "📁"
         else:
             # Determine icon by mime type or extension
             mime = item.get('mimeType', '')
             if 'video' in mime:
-                icon = "🎬"
+                icon = "🎥"
             elif 'audio' in mime or 'music' in mime:
-                icon = "🎵"
+                icon = "🎧"
             elif 'image' in mime:
                 icon = "🖼️"
             elif 'pdf' in mime:
@@ -783,17 +792,16 @@ def build_browser_keyboard(user_id, folders, files, total_items):
                 icon = "📄"
         
         # Truncate name to fit better
-        display_name = name[:30] + "..." if len(name) > 30 else name
+        display_name = name[:45] + "..." if len(name) > 45 else name
         
         if is_folder:
-            # Folders: checkbox + name with icon + open button
+            # Folders: checkbox (small) + name with icon (large, no size button)
             keyboard.append([
                 InlineKeyboardButton(checkbox, callback_data=f"browser_select|{item['id']}"),
-                InlineKeyboardButton(f"{icon} {display_name}", callback_data=f"browser_open|{item['id']}"),
-                InlineKeyboardButton(f"💾 {size}", callback_data=f"browser_info|{item['id']}")
+                InlineKeyboardButton(f"{icon} {display_name}", callback_data=f"browser_open|{item['id']}")
             ])
         else:
-            # Files: checkbox + name with icon + size
+            # Files: checkbox (small) + name with icon (large) + size (small)
             keyboard.append([
                 InlineKeyboardButton(checkbox, callback_data=f"browser_select|{item['id']}"),
                 InlineKeyboardButton(f"{icon} {display_name}", callback_data=f"browser_info|{item['id']}"),
@@ -840,6 +848,13 @@ def build_browser_keyboard(user_id, folders, files, total_items):
         )
         
         keyboard.append(selection_row)
+    else:
+        # NEW: Show "Select All" when nothing is selected
+        if total_items > 0:
+            keyboard.append([
+                InlineKeyboardButton("☑️ Select All on Page", callback_data="browser_select_page"),
+                InlineKeyboardButton("☑️ Select All Files", callback_data="browser_select_all_files")
+            ])
     
     # Utility row
     utility_row = []
@@ -1092,12 +1107,18 @@ async def download_from_drive_task(client, status_msg, file_ids, service):
                 ACTIVE_TASKS[task_id]['current_file'] = filename
                 ACTIVE_TASKS[task_id]['progress'] = int((idx - 1) / total_files * 100)
                 
+                # ADD: Cancel button for downloads
+                cancel_button = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🛑 Cancel Download", callback_data=f"cancel_{task_id}")]
+                ])
+                
                 # Update status
                 await status_msg.edit_text(
                     f"📥 **Downloading from Drive ({idx}/{total_files})**\n"
                     f"📄 `{filename[:50]}...`\n"
                     f"💾 Size: {format_size(file_size)}\n"
-                    f"✅ {successful} | ❌ {failed}"
+                    f"✅ {successful} | ❌ {failed}",
+                    reply_markup=cancel_button
                 )
                 
                 # Download file from Drive
@@ -2536,13 +2557,23 @@ async def status_command(client, message):
     uptime = str(datetime.timedelta(seconds=int(time.time() - START_TIME)))
     status_text += (
         f"\n━━━━━━━━━━━━━━━\n"
-        f"⏱️ Uptime: {uptime}\n"
-        f"📈 Total: {TOTAL_FILES:,} files ({TOTAL_BYTES/1024/1024/1024:.2f} GB)"
+        f"⏱️ **Uptime:** {uptime}\n"
+        f"📈 **Total Uploaded:** {TOTAL_FILES:,} files ({TOTAL_BYTES/1024/1024/1024:.2f} GB)\n"
+        f"💾 **Browser Sessions:** {len(BROWSER_SESSIONS)} active"
     )
-    status_text += f"\n⏱️ **Uptime:** {uptime}\n"
-    status_text += f"📈 **Total Uploaded:** {TOTAL_FILES} files ({TOTAL_BYTES/1024/1024/1024:.2f} GB)"
     
-    await message.reply_text(status_text)
+    # NEW: Add cancel buttons for each active task
+    if ACTIVE_TASKS:
+        keyboard = []
+        for task_id in list(ACTIVE_TASKS.keys())[:5]:  # Max 5 buttons
+            keyboard.append([InlineKeyboardButton(
+                f"🛑 Cancel {task_id[:15]}...", 
+                callback_data=f"cancel_{task_id}"
+            )])
+        
+        await message.reply_text(status_text, reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await message.reply_text(status_text)
 
 @app.on_message(filters.command("retry") & filters.user(OWNER_ID))
 async def retry_command(client, message):
@@ -2613,7 +2644,7 @@ async def browse_command(client, message):
             return
         
         # Build keyboard
-        keyboard = build_browser_keyboard(user_id, folders, files, total_items)
+        keyboard = build_browser_keyboard(user_id, folders, files, total_items, service)
         breadcrumb = get_breadcrumb(session)
         
         await message.reply_text(
@@ -2660,7 +2691,7 @@ async def search_command(client, message):
         session['page'] = 0
         session['selected_files'] = []
         
-        keyboard = build_browser_keyboard(user_id, folders, files, total_results)
+        keyboard = build_browser_keyboard(user_id, folders, files, total_results, service)
         
         await status.edit_text(
             f"🔍 **Search Results**\n"
@@ -2796,10 +2827,17 @@ async def handle_callback(client, query):
                     await query.answer("❌ Folder not found", show_alert=True)
                     return
                 
+                # FIXED: Save current page before navigating
+                current_page = session.get('page', 0)
+                
                 # Update session
                 session['current_folder'] = folder_id
-                session['path'].append({'name': folder_info['name'], 'id': folder_id})
-                session['page'] = 0
+                session['path'].append({
+                    'name': folder_info['name'], 
+                    'id': folder_id,
+                    'parent_page': current_page  # SAVE PAGE NUMBER
+                })
+                session['page'] = 0  # Reset to page 0 in new folder
                 session['selected_files'] = []
                 
                 # List files in folder
@@ -2815,7 +2853,7 @@ async def handle_callback(client, query):
                     return
                 
                 # Build keyboard
-                keyboard = build_browser_keyboard(user_id, folders, files, total_items)
+                keyboard = build_browser_keyboard(user_id, folders, files, total_items, service)
                 breadcrumb = get_breadcrumb(session)
                 
                 await query.message.edit_text(
@@ -2845,7 +2883,7 @@ async def handle_callback(client, query):
                 try:
                     folders, files, _ = list_drive_files(service, session['current_folder'])
                     total_items = len(folders) + len(files)
-                    keyboard = build_browser_keyboard(user_id, folders, files, total_items)
+                    keyboard = build_browser_keyboard(user_id, folders, files, total_items, service)
                     breadcrumb = get_breadcrumb(session)
                     
                     await query.message.edit_text(
@@ -3014,7 +3052,7 @@ async def handle_callback(client, query):
                 # Refresh display
                 folders, files, _ = list_drive_files(service, session['current_folder'])
                 total_items = len(folders) + len(files)
-                keyboard = build_browser_keyboard(user_id, folders, files, total_items)
+                keyboard = build_browser_keyboard(user_id, folders, files, total_items, service)
                 breadcrumb = get_breadcrumb(session)
                 
                 await query.message.edit_text(
@@ -3025,18 +3063,72 @@ async def handle_callback(client, query):
                 )
                 await query.answer("✅ Selection cleared", show_alert=False)
             
+            # NEW: Select all files on current page
+            elif query.data == "browser_select_page":
+                folders, files, _ = list_drive_files(service, session['current_folder'])
+                page = session.get('page', 0)
+                start_idx = page * ITEMS_PER_PAGE
+                end_idx = start_idx + ITEMS_PER_PAGE
+                
+                all_items = folders + files
+                page_items = all_items[start_idx:end_idx]
+                
+                # Add all items on page to selection
+                for item in page_items:
+                    if item['id'] not in session['selected_files']:
+                        session['selected_files'].append(item['id'])
+                
+                total_items = len(folders) + len(files)
+                keyboard = build_browser_keyboard(user_id, folders, files, total_items, service)
+                breadcrumb = get_breadcrumb(session)
+                
+                await query.message.edit_text(
+                    f"📁 **File Browser**\n"
+                    f"📍 {breadcrumb}\n"
+                    f"📊 {len(folders)} folders, {len(files)} files",
+                    reply_markup=keyboard
+                )
+                await query.answer(f"✅ Selected {len(page_items)} items", show_alert=False)
+            
+            # NEW: Select all files (only files, not folders) in current folder
+            elif query.data == "browser_select_all_files":
+                folders, files, _ = list_drive_files(service, session['current_folder'])
+                
+                # Add all files (not folders) to selection
+                for file in files:
+                    if file['id'] not in session['selected_files']:
+                        session['selected_files'].append(file['id'])
+                
+                total_items = len(folders) + len(files)
+                keyboard = build_browser_keyboard(user_id, folders, files, total_items, service)
+                breadcrumb = get_breadcrumb(session)
+                
+                await query.message.edit_text(
+                    f"📁 **File Browser**\n"
+                    f"📍 {breadcrumb}\n"
+                    f"📊 {len(folders)} folders, {len(files)} files",
+                    reply_markup=keyboard
+                )
+                await query.answer(f"✅ Selected {len(files)} files", show_alert=False)
+            
             # Back button
             elif query.data == "browser_back":
                 if len(session['path']) > 1:
-                    session['path'].pop()
+                    # Pop current folder
+                    popped = session['path'].pop()
+                    
+                    # Go to parent folder
                     session['current_folder'] = session['path'][-1]['id']
-                    session['page'] = 0
+                    
+                    # FIXED: Restore the page we were on before entering this folder
+                    session['page'] = popped.get('parent_page', 0)
+                    
                     session['selected_files'] = []
                     
                     # List files
                     folders, files, _ = list_drive_files(service, session['current_folder'])
                     total_items = len(folders) + len(files)
-                    keyboard = build_browser_keyboard(user_id, folders, files, total_items)
+                    keyboard = build_browser_keyboard(user_id, folders, files, total_items, service)
                     breadcrumb = get_breadcrumb(session)
                     
                     await query.message.edit_text(
@@ -3057,7 +3149,7 @@ async def handle_callback(client, query):
                 # List files
                 folders, files, _ = list_drive_files(service, DRIVE_FOLDER_ID)
                 total_items = len(folders) + len(files)
-                keyboard = build_browser_keyboard(user_id, folders, files, total_items)
+                keyboard = build_browser_keyboard(user_id, folders, files, total_items, service)
                 breadcrumb = get_breadcrumb(session)
                 
                 await query.message.edit_text(
@@ -3074,7 +3166,7 @@ async def handle_callback(client, query):
                 
                 folders, files, _ = list_drive_files(service, session['current_folder'])
                 total_items = len(folders) + len(files)
-                keyboard = build_browser_keyboard(user_id, folders, files, total_items)
+                keyboard = build_browser_keyboard(user_id, folders, files, total_items, service)
                 breadcrumb = get_breadcrumb(session)
                 
                 await query.message.edit_text(
@@ -3092,7 +3184,7 @@ async def handle_callback(client, query):
                 
                 session['page'] = min(max_page, session['page'] + 1)
                 
-                keyboard = build_browser_keyboard(user_id, folders, files, total_items)
+                keyboard = build_browser_keyboard(user_id, folders, files, total_items, service)
                 breadcrumb = get_breadcrumb(session)
                 
                 await query.message.edit_text(
@@ -3107,7 +3199,7 @@ async def handle_callback(client, query):
             elif query.data == "browser_refresh":
                 folders, files, _ = list_drive_files(service, session['current_folder'])
                 total_items = len(folders) + len(files)
-                keyboard = build_browser_keyboard(user_id, folders, files, total_items)
+                keyboard = build_browser_keyboard(user_id, folders, files, total_items, service)
                 breadcrumb = get_breadcrumb(session)
                 
                 await query.message.edit_text(
@@ -3321,9 +3413,16 @@ async def handle_callback(client, query):
                     supportsAllDrives=True
                 ).execute()
                 
-                session['path'].append({'id': session['current_folder'], 'name': folder_info['name']})
+                # FIXED: Save current page before navigating
+                current_page = session.get('page', 0)
+                
+                session['path'].append({
+                    'id': session['current_folder'], 
+                    'name': folder_info['name'],
+                    'parent_page': current_page  # SAVE PAGE
+                })
                 session['current_folder'] = folder_id
-                session['page'] = 0
+                session['page'] = 0  # Reset to page 0 in new folder
             except Exception as e:
                 await query.answer(f"❌ Error: {str(e)}", show_alert=True)
                 return
@@ -3423,10 +3522,15 @@ async def handle_callback(client, query):
             session = BROWSER_SESSIONS[user_id]
             
             if session['path'] and len(session['path']) > 1:
-                session['path'].pop()
+                # Pop current folder
+                popped = session['path'].pop()
+                
+                # Get parent folder
                 prev_folder = session['path'][-1]
                 session['current_folder'] = prev_folder['id']
-                session['page'] = 0
+                
+                # FIXED: Restore the page we were on
+                session['page'] = popped.get('parent_page', 0)
                 
                 service = get_drive_service()
                 if not service:
