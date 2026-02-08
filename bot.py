@@ -1447,6 +1447,11 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
                     downloader = MediaIoBaseDownload(fh, request)
                     
                     done = False
+                    last_update = 0
+                    drive_start_time = time.time()
+                    last_drive_bytes = 0
+                    last_drive_speed_update = drive_start_time
+                    
                     while not done:
                         if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
                             fh.close()
@@ -1456,6 +1461,73 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
                             return
                         
                         status, done = downloader.next_chunk()
+                        
+                        # Update progress with speed and ETA
+                        if status:
+                            progress = int(status.progress() * 100)
+                            current_bytes = int(status.progress() * file_size)
+                            current_time = time.time()
+                            
+                            # Only update every 3 seconds to avoid FloodWait
+                            if current_time - last_update >= 3 or done:
+                                # Calculate speed
+                                time_diff = current_time - last_drive_speed_update
+                                bytes_diff = current_bytes - last_drive_bytes
+                                
+                                if time_diff > 0:
+                                    drive_speed = bytes_diff / time_diff
+                                else:
+                                    drive_speed = 0
+                                
+                                # Calculate ETA
+                                if drive_speed > 0 and current_bytes < file_size:
+                                    remaining_bytes = file_size - current_bytes
+                                    eta_seconds = remaining_bytes / drive_speed
+                                    eta_str = format_time(eta_seconds)
+                                else:
+                                    eta_str = "Calculating..." if current_bytes < file_size else "Done"
+                                
+                                # Update tracking
+                                last_update = current_time
+                                last_drive_speed_update = current_time
+                                last_drive_bytes = current_bytes
+                                
+                                # Build status with worker info
+                                async with upload_state['lock']:
+                                    completed = upload_state['completed']
+                                    successful = upload_state['successful']
+                                    failed = upload_state['failed']
+                                
+                                progress_bar = create_progress_bar(progress, length=12)
+                                
+                                status_lines = [
+                                    f"📥 **Downloading from Drive**",
+                                    f"━━━━━━━━━━━━━━━",
+                                    f"📊 Overall: {completed}/{total_files}",
+                                    f"✅ Success: {successful} | ❌ Failed: {failed}",
+                                    f"",
+                                    f"🔄 **Worker {worker_id}:**"
+                                ]
+                                
+                                if folder_name:
+                                    status_lines.append(f"📁 {folder_name}")
+                                
+                                status_lines.extend([
+                                    f"📄 `{filename[:40]}...`",
+                                    f"💾 {format_size(current_bytes)} / {format_size(file_size)}",
+                                    f"",
+                                    f"{progress_bar}",
+                                    f"⚡ Speed: {format_size(drive_speed)}/s",
+                                    f"⏱️ ETA: {eta_str}"
+                                ])
+                                
+                                try:
+                                    await status_msg.edit_text("\n".join(status_lines))
+                                except FloodWait as e:
+                                    logger.warning(f"FloodWait during Drive download: {e.value}s")
+                                    await asyncio.sleep(e.value)
+                                except Exception as e:
+                                    logger.debug(f"Status update error (non-critical): {e}")
                     
                     fh.close()
                     
@@ -1466,7 +1538,7 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
                                 worker['stage'] = 'uploading'
                                 break
                     
-                    # Send to Telegram
+                    # Send to Telegram with progress tracking
                     mime_type = file_meta.get('mimeType', '')
                     is_audio = download_path.lower().endswith(('.mp3', '.m4a', '.m4b', '.flac', '.wav', '.ogg', '.aac', '.opus', '.wma', '.ape'))
                     is_video = download_path.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm', '.wmv', '.flv', '.3gp')) or 'video' in mime_type
@@ -1481,13 +1553,73 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
                     else:
                         caption = filename
                     
+                    # Progress callback for Telegram upload
+                    upload_start_time = time.time()
+                    last_progress_update = 0
+                    
+                    async def progress_callback(current, total):
+                        nonlocal last_progress_update
+                        current_time = time.time()
+                        
+                        # Update every 2 seconds to avoid FloodWait
+                        if current_time - last_progress_update >= 2:
+                            last_progress_update = current_time
+                            
+                            progress_pct = int((current / total) * 100) if total > 0 else 0
+                            progress_bar = create_progress_bar(progress_pct, length=12)
+                            
+                            # Calculate speed
+                            elapsed = current_time - upload_start_time
+                            speed = current / elapsed if elapsed > 0 else 0
+                            speed_str = f"{format_size(int(speed))}/s"
+                            
+                            # Calculate ETA
+                            remaining = total - current
+                            eta = remaining / speed if speed > 0 else 0
+                            eta_str = format_time(int(eta))
+                            
+                            # Build status
+                            async with upload_state['lock']:
+                                completed = upload_state['completed']
+                                successful = upload_state['successful']
+                                failed = upload_state['failed']
+                            
+                            status_lines = [
+                                f"📤 **Uploading to Telegram**",
+                                f"━━━━━━━━━━━━━━━",
+                                f"📊 Overall: {completed}/{total_files}",
+                                f"✅ Success: {successful} | ❌ Failed: {failed}",
+                                f"",
+                                f"🔄 **Worker {worker_id}:**"
+                            ]
+                            
+                            if folder_name:
+                                status_lines.append(f"📁 {folder_name}")
+                            
+                            status_lines.extend([
+                                f"📄 `{filename[:40]}...`",
+                                f"💾 {format_size(current)} / {format_size(total)}",
+                                f"",
+                                f"{progress_bar}",
+                                f"⚡ Speed: {speed_str}",
+                                f"⏱️ ETA: {eta_str}"
+                            ])
+                            
+                            try:
+                                await status_msg.edit_text("\n".join(status_lines))
+                            except FloodWait as e:
+                                logger.warning(f"FloodWait during upload: {e.value}s")
+                                await asyncio.sleep(e.value)
+                            except Exception as e:
+                                logger.debug(f"Upload progress update error (non-critical): {e}")
+                    
                     # Send based on file type
                     if download_path.lower().endswith(('.mp3', '.m4a', '.m4b', '.flac', '.wav', '.ogg', '.aac', '.opus', '.wma', '.ape')):
                         # Extract metadata for audio files
                         metadata = extract_audio_metadata(download_path)
                         thumbnail_path = await extract_audio_thumbnail(download_path)
                         
-                        # Send with metadata
+                        # Send with metadata and progress
                         await client.send_audio(
                             status_msg.chat.id,
                             download_path,
@@ -1495,7 +1627,8 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
                             title=metadata.get('title'),
                             performer=metadata.get('performer'),
                             duration=metadata.get('duration'),
-                            thumb=thumbnail_path
+                            thumb=thumbnail_path,
+                            progress=progress_callback
                         )
                         
                         # Clean up thumbnail
@@ -1509,19 +1642,22 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
                         await client.send_video(
                             status_msg.chat.id,
                             download_path,
-                            caption=caption
+                            caption=caption,
+                            progress=progress_callback
                         )
                     elif download_path.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp')) or 'image' in mime_type:
                         await client.send_photo(
                             status_msg.chat.id,
                             download_path,
-                            caption=caption
+                            caption=caption,
+                            progress=progress_callback
                         )
                     else:
                         await client.send_document(
                             status_msg.chat.id,
                             download_path,
-                            caption=caption
+                            caption=caption,
+                            progress=progress_callback
                         )
                     
                     # Clean up
