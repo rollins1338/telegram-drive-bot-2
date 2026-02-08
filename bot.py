@@ -33,6 +33,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 from pyrogram.errors import FloodWait
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from concurrent.futures import ThreadPoolExecutor
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload, MediaIoBaseUpload
 from googleapiclient.errors import HttpError
 import logging
@@ -132,7 +133,7 @@ PENDING_FOLDER_SELECTION = {}  # Format: {user_id: {'file_list': [], 'series_nam
 
 # Pagination settings
 ITEMS_PER_PAGE = 8
-
+DRIVE_THREAD_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="DriveIO")
 # ==================== GOOGLE DRIVE FUNCTIONS ====================
 def get_drive_service():
     """Get authenticated Google Drive service"""
@@ -440,6 +441,414 @@ def format_time(seconds):
         hours = int(seconds/3600)
         mins = int((seconds%3600)/60)
         return f"{hours}h {mins}m"
+        
+# ==================== BLOCKING I/O WRAPPERS ====================
+
+def download_from_drive_sync(service, file_id, file_path, file_size, progress_dict):
+    """
+    BLOCKING function - downloads file from Google Drive
+    Runs in ThreadPoolExecutor to avoid blocking event loop
+    
+    Args:
+        progress_dict: Dictionary to store progress info (thread-safe updates)
+    """
+    request = service.files().get_media(fileId=file_id)
+    fh = io.FileIO(file_path, 'wb')
+    downloader = MediaIoBaseDownload(fh, request)
+    
+    done = False
+    start_time = time.time()
+    last_progress_bytes = 0
+    last_speed_update = start_time
+    
+    while not done:
+        status, done = downloader.next_chunk()
+        
+        if status:
+            progress = int(status.progress() * 100)
+            current_bytes = int(status.progress() * file_size)
+            current_time = time.time()
+            
+            # Calculate speed
+            time_diff = current_time - last_speed_update
+            bytes_diff = current_bytes - last_progress_bytes
+            speed = bytes_diff / time_diff if time_diff > 0 else 0
+            
+            # Calculate ETA
+            remaining = file_size - current_bytes
+            eta = remaining / speed if speed > 0 else 0
+            
+            # Update progress dict (read by async code)
+            progress_dict['progress'] = progress
+            progress_dict['current'] = current_bytes
+            progress_dict['total'] = file_size
+            progress_dict['speed'] = speed
+            progress_dict['eta'] = int(eta)
+            progress_dict['done'] = done
+            
+            last_speed_update = current_time
+            last_progress_bytes = current_bytes
+    
+    fh.close()
+    return file_path
+
+
+def upload_to_drive_sync(service, file_path, file_metadata, progress_dict):
+    """
+    BLOCKING function - uploads file to Google Drive
+    Runs in ThreadPoolExecutor to avoid blocking event loop
+    """
+    file_size = os.path.getsize(file_path)
+    media = MediaFileUpload(file_path, resumable=True, chunksize=5*1024*1024)
+    
+    request = service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields='id, name, webViewLink'
+    )
+    
+    response = None
+    start_time = time.time()
+    last_progress_bytes = 0
+    last_speed_update = start_time
+    
+    while response is None:
+        status, response = request.next_chunk()
+        
+        if status:
+            progress = int(status.progress() * 100)
+            current_bytes = int(status.progress() * file_size)
+            current_time = time.time()
+            
+            # Calculate speed
+            time_diff = current_time - last_speed_update
+            bytes_diff = current_bytes - last_progress_bytes
+            speed = bytes_diff / time_diff if time_diff > 0 else 0
+            
+            # Calculate ETA
+            remaining = file_size - current_bytes
+            eta = remaining / speed if speed > 0 else 0
+            
+            # Update progress dict
+            progress_dict['progress'] = progress
+            progress_dict['current'] = current_bytes
+            progress_dict['total'] = file_size
+            progress_dict['speed'] = speed
+            progress_dict['eta'] = int(eta)
+            progress_dict['done'] = (response is not None)
+            
+            last_speed_update = current_time
+            last_progress_bytes = current_bytes
+    
+    return response     
+
+# ==================== ASYNC TASK FUNCTIONS (RUN IN PARALLEL) ====================
+
+async def process_one_file_drive_to_telegram(client, service, file_meta, task_id, task_state, status_msg):
+    """
+    Process ONE file: Download from Drive → Upload to Telegram
+    
+    This function runs in parallel with other instances via asyncio.gather()
+    """
+    loop = asyncio.get_event_loop()
+    file_id = file_meta['id']
+    filename = file_meta['name']
+    file_size = int(file_meta.get('size', 0))
+    folder_name = file_meta.get('folder_name', None)
+    
+    download_path = f"downloads/{filename}"
+    os.makedirs("downloads", exist_ok=True)
+    
+    try:
+        # === PHASE 1: DOWNLOAD FROM DRIVE ===
+        # Progress tracking dict (shared with blocking thread)
+        drive_progress = {
+            'progress': 0,
+            'current': 0,
+            'total': file_size,
+            'speed': 0,
+            'eta': 0,
+            'done': False
+        }
+        
+        # Run BLOCKING download in thread pool (doesn't block event loop!)
+        download_task = loop.run_in_executor(
+            DRIVE_THREAD_POOL,
+            download_from_drive_sync,
+            service,
+            file_id,
+            download_path,
+            file_size,
+            drive_progress
+        )
+        
+        # Monitor progress while download runs in background
+        while not drive_progress['done']:
+            # Update task state for UI
+            async with task_state['lock']:
+                task_state['files'][filename] = {
+                    'stage': 'downloading_drive',
+                    'progress': drive_progress['progress'],
+                    'current': drive_progress['current'],
+                    'total': drive_progress['total'],
+                    'speed': drive_progress['speed'],
+                    'eta': drive_progress['eta']
+                }
+            
+            await asyncio.sleep(1)  # Check progress every second
+            
+            # Check cancellation
+            if task_state.get('cancelled', False):
+                # Cancel the download (thread will complete but we'll clean up)
+                if os.path.exists(download_path):
+                    os.remove(download_path)
+                return
+        
+        # Wait for download to complete
+        await download_task
+        
+        # === PHASE 2: UPLOAD TO TELEGRAM ===
+        telegram_progress = {
+            'progress': 0,
+            'current': 0,
+            'total': file_size,
+            'speed': 0,
+            'eta': 0
+        }
+        
+        # Progress callback for Telegram upload
+        async def tg_progress(current, total):
+            elapsed = time.time() - start_time
+            speed = current / elapsed if elapsed > 0 else 0
+            eta = (total - current) / speed if speed > 0 else 0
+            
+            telegram_progress['progress'] = int((current/total)*100) if total > 0 else 0
+            telegram_progress['current'] = current
+            telegram_progress['total'] = total
+            telegram_progress['speed'] = speed
+            telegram_progress['eta'] = int(eta)
+            
+            # Update task state
+            async with task_state['lock']:
+                task_state['files'][filename] = {
+                    'stage': 'uploading_telegram',
+                    'progress': telegram_progress['progress'],
+                    'current': telegram_progress['current'],
+                    'total': telegram_progress['total'],
+                    'speed': telegram_progress['speed'],
+                    'eta': telegram_progress['eta']
+                }
+        
+        start_time = time.time()
+        
+        # Check cancellation before upload
+        if task_state.get('cancelled', False):
+            if os.path.exists(download_path):
+                os.remove(download_path)
+            return
+        
+        # Send to Telegram (this is async, doesn't block!)
+        is_audio = download_path.lower().endswith(('.mp3', '.m4a', '.m4b', '.flac', '.ogg'))
+        is_video = download_path.lower().endswith(('.mp4', '.mkv', '.avi', '.mov'))
+        
+        caption = f"📖 {folder_name}" if (is_audio and folder_name) else filename
+        
+        if is_audio:
+            # Extract metadata asynchronously
+            metadata = await loop.run_in_executor(None, extract_audio_metadata, download_path)
+            thumbnail = await extract_audio_thumbnail(download_path)
+            
+            await client.send_audio(
+                status_msg.chat.id,
+                download_path,
+                caption=caption,
+                title=metadata.get('title'),
+                performer=metadata.get('performer'),
+                duration=metadata.get('duration'),
+                thumb=thumbnail,
+                progress=tg_progress
+            )
+            
+            if thumbnail and os.path.exists(thumbnail):
+                os.remove(thumbnail)
+        elif is_video:
+            await client.send_video(
+                status_msg.chat.id,
+                download_path,
+                caption=caption,
+                progress=tg_progress
+            )
+        else:
+            await client.send_document(
+                status_msg.chat.id,
+                download_path,
+                caption=caption,
+                progress=tg_progress
+            )
+        
+        # Success!
+        async with task_state['lock']:
+            task_state['successful'] += 1
+            del task_state['files'][filename]
+        
+        # Cleanup
+        if os.path.exists(download_path):
+            os.remove(download_path)
+    
+    except Exception as e:
+        async with task_state['lock']:
+            task_state['failed'] += 1
+            if filename in task_state['files']:
+                del task_state['files'][filename]
+        
+        if os.path.exists(download_path):
+            os.remove(download_path)
+        
+        raise
+
+
+async def process_one_file_telegram_to_drive(client, service, file_info, task_id, task_state, status_msg, parent_folder, flat_upload):
+    """
+    Process ONE file: Download from Telegram → Upload to Drive
+    
+    This function runs in parallel with other instances via asyncio.gather()
+    """
+    loop = asyncio.get_event_loop()
+    filename = file_info['name']
+    msg_id = file_info['msg_id']
+    download_path = f"downloads/{filename}"
+    
+    try:
+        # === PHASE 1: DOWNLOAD FROM TELEGRAM ===
+        telegram_progress = {
+            'progress': 0,
+            'current': 0,
+            'total': 0,
+            'speed': 0,
+            'eta': 0
+        }
+        
+        start_time = time.time()
+        
+        async def tg_download_progress(current, total):
+            elapsed = time.time() - start_time
+            speed = current / elapsed if elapsed > 0 else 0
+            eta = (total - current) / speed if speed > 0 else 0
+            
+            telegram_progress['progress'] = int((current/total)*100) if total > 0 else 0
+            telegram_progress['current'] = current
+            telegram_progress['total'] = total
+            telegram_progress['speed'] = speed
+            telegram_progress['eta'] = int(eta)
+            
+            async with task_state['lock']:
+                task_state['files'][filename] = {
+                    'stage': 'downloading_telegram',
+                    'progress': telegram_progress['progress'],
+                    'current': telegram_progress['current'],
+                    'total': telegram_progress['total'],
+                    'speed': telegram_progress['speed'],
+                    'eta': telegram_progress['eta']
+                }
+        
+        # Download from Telegram (async, doesn't block!)
+        message = await client.get_messages(status_msg.chat.id, msg_id)
+        await client.download_media(
+            message,
+            file_name=download_path,
+            progress=tg_download_progress
+        )
+        
+        if not os.path.exists(download_path):
+            raise Exception("Download failed")
+        
+        # Check cancellation
+        if task_state.get('cancelled', False):
+            if os.path.exists(download_path):
+                os.remove(download_path)
+            return
+        
+        # === PHASE 2: UPLOAD TO DRIVE ===
+        # Determine upload folder
+        if flat_upload:
+            upload_folder = parent_folder
+        else:
+            folder_name = os.path.splitext(filename)[0]
+            upload_folder = await loop.run_in_executor(
+                None,
+                get_or_create_folder,
+                service,
+                folder_name,
+                parent_folder
+            )
+        
+        file_metadata = {
+            'name': filename,
+            'parents': [upload_folder]
+        }
+        
+        # Progress tracking for Drive upload
+        drive_progress = {
+            'progress': 0,
+            'current': 0,
+            'total': os.path.getsize(download_path),
+            'speed': 0,
+            'eta': 0,
+            'done': False
+        }
+        
+        # Run BLOCKING upload in thread pool
+        upload_task = loop.run_in_executor(
+            DRIVE_THREAD_POOL,
+            upload_to_drive_sync,
+            service,
+            download_path,
+            file_metadata,
+            drive_progress
+        )
+        
+        # Monitor upload progress
+        while not drive_progress['done']:
+            async with task_state['lock']:
+                task_state['files'][filename] = {
+                    'stage': 'uploading_drive',
+                    'progress': drive_progress['progress'],
+                    'current': drive_progress['current'],
+                    'total': drive_progress['total'],
+                    'speed': drive_progress['speed'],
+                    'eta': drive_progress['eta']
+                }
+            
+            await asyncio.sleep(1)
+            
+            # Check cancellation
+            if task_state.get('cancelled', False):
+                if os.path.exists(download_path):
+                    os.remove(download_path)
+                return
+        
+        # Wait for upload to complete
+        result = await upload_task
+        
+        # Success!
+        async with task_state['lock']:
+            task_state['successful'] += 1
+            del task_state['files'][filename]
+        
+        # Cleanup
+        if os.path.exists(download_path):
+            os.remove(download_path)
+    
+    except Exception as e:
+        async with task_state['lock']:
+            task_state['failed'] += 1
+            if filename in task_state['files']:
+                del task_state['files'][filename]
+        
+        if os.path.exists(download_path):
+            os.remove(download_path)
+        
+        raise    
 
 # ==================== GOOGLE DRIVE DOWNLOAD FUNCTIONS ====================
 def extract_file_id_from_url(url):
@@ -1231,8 +1640,9 @@ async def download_from_drive_task(client, status_msg, file_ids, service):
                 # IMPORTANT: Check file extensions first for accurate type detection
                 
                 if download_path.lower().endswith(('.mp3', '.m4a', '.m4b', '.flac', '.wav', '.ogg', '.aac', '.opus', '.wma', '.ape')):
-                    # Extract metadata for audio files
-                    metadata = extract_audio_metadata(download_path)
+                    # Extract metadata for audio files (run in executor to avoid blocking)
+                    loop = asyncio.get_running_loop()
+                    metadata = await loop.run_in_executor(None, extract_audio_metadata, download_path)
                     thumbnail_path = await extract_audio_thumbnail(download_path)
                     
                     # Send with metadata
@@ -1299,15 +1709,25 @@ async def download_from_drive_task(client, status_msg, file_ids, service):
             del ACTIVE_TASKS[task_id]
 
 async def upload_to_telegram_task(client, status_msg, folders, files, service):
-    """Upload selected folders and files from Drive to Telegram"""
-    task_id = f"upload_tg_{status_msg.chat.id}_{status_msg.id}"
-    ACTIVE_TASKS[task_id] = {
-        'cancelled': False,
-        'files_list': [],
-        'current_file': None,
-        'progress': 0,
-        'status': 'initializing'
-    }
+    """Upload files from Drive to Telegram with TRUE concurrency"""
+    # ... (collect files from folders - keep your existing code)
+    
+    # Filter to audio/video files
+    uploadable_files = [f for f in all_files if is_audio_or_video_file(f['name'], f.get('mimeType', ''))]
+    
+    # Call new concurrent function
+    successful, failed = await upload_to_telegram_concurrent(
+        client, status_msg, uploadable_files, service
+    )
+    
+    # Show final status
+    elapsed = time.time() - start_time
+    await status_msg.edit_text(
+        f"✅ **Complete!**\n"
+        f"✅ Success: {successful}\n"
+        f"❌ Failed: {failed}\n"
+        f"⏱️ Time: {format_time(int(elapsed))}"
+    )
     
     successful = 0
     failed = 0
@@ -1584,8 +2004,9 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
                     
                     # Send based on file type
                     if download_path.lower().endswith(('.mp3', '.m4a', '.m4b', '.flac', '.wav', '.ogg', '.aac', '.opus', '.wma', '.ape')):
-                        # Extract metadata for audio files
-                        metadata = extract_audio_metadata(download_path)
+                        # Extract metadata for audio files (run in executor to avoid blocking)
+                        loop = asyncio.get_running_loop()
+                        metadata = await loop.run_in_executor(None, extract_audio_metadata, download_path)
                         thumbnail_path = await extract_audio_thumbnail(download_path)
                         
                         # Send with metadata and progress
@@ -1932,32 +2353,23 @@ async def progress_callback(current, total, message, start_time, filename, task_
         message.last_current = current
         message.last_time = now
 
-async def upload_task(client: Client, status_msg: Message, file_list: list, series_name: str = None, flat_upload: bool = False, queue_id: str = None, parent_folder_id: str = None):
-    """
-    Main upload task - handles batch uploading with proper organization and cancellation
+async def upload_task(client, status_msg, file_list, series_name=None, flat_upload=False, queue_id=None, parent_folder_id=None):
+    """Upload files from Telegram to Drive with TRUE concurrency"""
+    # ... (setup parent folder - keep your existing code)
     
-    Args:
-        client: Pyrogram client
-        status_msg: Status message to update
-        file_list: List of dicts with 'msg_id' and 'name'
-        series_name: Optional series name for organization
-        flat_upload: If True, upload directly to parent folder without subfolders
-        queue_id: Optional queue ID for tracking
-        parent_folder_id: NEW - Optional parent folder ID (defaults to DRIVE_FOLDER_ID)
-    """
-    global TOTAL_FILES, TOTAL_BYTES
+    # Call new concurrent function
+    successful, failed = await upload_to_drive_concurrent(
+        client, status_msg, file_list, service, parent_folder, flat_upload
+    )
     
-    # NEW: Use provided parent_folder_id or default to DRIVE_FOLDER_ID
-    upload_parent = parent_folder_id if parent_folder_id else DRIVE_FOLDER_ID
-    
-    task_id = f"{status_msg.chat.id}_{status_msg.id}"
-    ACTIVE_TASKS[task_id] = {
-        'cancelled': False, 
-        'files_list': file_list,
-        'current_file': None,
-        'progress': 0,
-        'status': 'initializing'
-    }
+    # Show final status
+    elapsed = time.time() - start_time
+    await status_msg.edit_text(
+        f"✅ **Complete!**\n"
+        f"✅ Success: {successful}\n"
+        f"❌ Failed: {failed}\n"
+        f"⏱️ Time: {format_time(int(elapsed))}"
+    )
     
     # Update queue status
     if queue_id and queue_id in UPLOAD_QUEUE:
@@ -1977,8 +2389,15 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
         
         # MODIFIED: Determine parent folder - use upload_parent instead of DRIVE_FOLDER_ID
         if series_name and not flat_upload:
-            # Create series folder in the selected parent
-            parent_folder = get_or_create_folder(service, series_name, upload_parent)
+            # Create series folder in the selected parent (run in executor)
+            loop = asyncio.get_running_loop()
+            parent_folder = await loop.run_in_executor(
+                None,
+                get_or_create_folder,
+                service,
+                series_name,
+                upload_parent
+            )
             if not parent_folder:
                 await status_msg.edit_text(f"❌ **Failed to create series folder:** {series_name}")
                 if task_id in ACTIVE_TASKS:
@@ -1992,6 +2411,9 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
         
         # Create downloads directory if not exists
         os.makedirs("downloads", exist_ok=True)
+        
+        # Track start time for final stats
+        start_time = time.time()
         
         # Shared state for concurrent workers
         upload_state = {
@@ -2122,7 +2544,15 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
                                 upload_folder = parent_folder
                             else:
                                 folder_name = os.path.splitext(clean_name)[0]
-                                file_folder = get_or_create_folder(service, folder_name, parent_folder)
+                                # Run folder creation in executor to avoid blocking
+                                loop = asyncio.get_running_loop()
+                                file_folder = await loop.run_in_executor(
+                                    None, 
+                                    get_or_create_folder, 
+                                    service, 
+                                    folder_name, 
+                                    parent_folder
+                                )
                                 
                                 if not file_folder:
                                     raise Exception("Failed to create file folder")
