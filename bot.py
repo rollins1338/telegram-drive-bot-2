@@ -16,6 +16,13 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload, MediaIoBa
 from googleapiclient.errors import HttpError
 import logging
 
+# Configure logging FIRST before using it
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
 # Import mutagen for audio metadata extraction
 try:
     from mutagen import File as MutagenFile
@@ -26,13 +33,6 @@ try:
 except ImportError:
     MUTAGEN_AVAILABLE = False
     logger.warning("⚠️ Mutagen not installed - audio metadata will not be preserved")
-
-# Configure logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
 
 # ==================== HEALTH CHECK SERVER ====================
 # Ultra-minimal health check (Koyeb-tested and working)
@@ -1376,14 +1376,21 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
         # Worker function
         async def upload_worker(worker_id):
             while True:
+                # Check for cancellation FIRST before pulling from queue
+                if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
+                    break
+                
                 try:
-                    # Get next file from queue
+                    # Get next file from queue with timeout
                     file_meta = await asyncio.wait_for(file_queue.get(), timeout=1.0)
                 except asyncio.TimeoutError:
+                    # Queue is empty or timeout - check cancellation then exit
+                    if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
+                        break
                     # Queue is empty, worker can exit
                     break
                 
-                # Check for cancellation
+                # Double-check for cancellation after getting file
                 if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
                     file_queue.task_done()
                     break
@@ -1559,20 +1566,30 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
         successful = upload_state['successful']
         failed = upload_state['failed']
         
-        status_text = (
-            f"✅ **Upload to Telegram Complete!**\n"
-            f"━━━━━━━━━━━━━━━\n\n"
-            f"✅ Successful: {successful}/{total_files}\n"
-        )
-        
-        if failed > 0:
-            status_text += f"❌ Failed: {failed}\n"
-        
-        status_text += f"⏱️ Time: {format_time(elapsed_time)}\n"
-        
-        if successful > 0 and elapsed_time > 0:
-            avg_time_per_file = elapsed_time / successful
-            status_text += f"⚡ Avg: {format_time(avg_time_per_file)}/file"
+        # Check if task was cancelled
+        if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
+            status_text = (
+                f"🛑 **Upload Cancelled**\n"
+                f"━━━━━━━━━━━━━━━\n\n"
+                f"✅ Sent: {successful}/{total_files}\n"
+                f"❌ Failed: {failed}\n"
+                f"⏱️ Time: {format_time(elapsed_time)}"
+            )
+        else:
+            status_text = (
+                f"✅ **Upload to Telegram Complete!**\n"
+                f"━━━━━━━━━━━━━━━\n\n"
+                f"✅ Successful: {successful}/{total_files}\n"
+            )
+            
+            if failed > 0:
+                status_text += f"❌ Failed: {failed}\n"
+            
+            status_text += f"⏱️ Time: {format_time(elapsed_time)}\n"
+            
+            if successful > 0 and elapsed_time > 0:
+                avg_time_per_file = elapsed_time / successful
+                status_text += f"⚡ Avg: {format_time(avg_time_per_file)}/file"
         
         await status_msg.edit_text(status_text)
     
