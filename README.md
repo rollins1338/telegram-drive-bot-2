@@ -38,7 +38,7 @@ A Telegram bot for seamless Google Drive integration with advanced file manageme
 
 1. Clone the repository
 ```bash
-git clone https://github.com/yourusername/rxuploader-bot.git
+git clone https://github.com/rollins1338/telegram-drive-bot-2.git
 cd rxuploader-bot
 ```
 
@@ -64,7 +64,7 @@ TOKEN_JSON='{"token": "...", "refresh_token": "...", ...}'
 
 4. Run the bot
 ```bash
-python bot_improved.py
+python bot.py
 ```
 
 ## Getting Credentials
@@ -111,7 +111,7 @@ The interactive file browser provides:
 
 ### Local Development
 ```bash
-python bot_improved.py
+python bot.py
 ```
 
 ### Production Deployment
@@ -178,7 +178,6 @@ The bot includes a health check server on port 8000 for monitoring.
 - Verify folder permissions
 - Review logs for specific errors
 
-See [Troubleshooting Guide](docs/TROUBLESHOOTING.md) for more details.
 
 ## Requirements
 
@@ -201,7 +200,7 @@ Contributions are welcome! Please:
 
 ## License
 
-This project is licensed under the MIT License - see [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License.
 
 ## Acknowledgments
 
@@ -213,13 +212,8 @@ Built with:
 ## Support
 
 For issues and questions:
-- Open an [issue](https://github.com/yourusername/rxuploader-bot/issues)
-- Check existing [discussions](https://github.com/yourusername/rxuploader-bot/discussions)
+- Open an [issue](https://github.com/rollins1338/telegram-drive-bot/issues)
 
 ---
 
 **Note**: This bot is for personal use. Ensure compliance with Google Drive and Telegram Terms of Service.- **Never commit:** `.env`, `token.json`, `*.session`, credential files
-
-## License
-
-MIT
