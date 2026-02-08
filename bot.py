@@ -1484,8 +1484,10 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
                                     remaining_bytes = file_size - current_bytes
                                     eta_seconds = remaining_bytes / drive_speed
                                     eta_str = format_time(eta_seconds)
+                                elif current_bytes >= file_size:
+                                    eta_str = "0s"  # Complete
                                 else:
-                                    eta_str = "Calculating..." if current_bytes < file_size else "Done"
+                                    eta_str = "--"  # Calculating
                                 
                                 # Update tracking
                                 last_update = current_time
@@ -1505,20 +1507,37 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
                                     f"━━━━━━━━━━━━━━━",
                                     f"📊 Overall: {completed}/{total_files}",
                                     f"✅ Success: {successful} | ❌ Failed: {failed}",
-                                    f"",
-                                    f"🔄 **Worker {worker_id}:**"
+                                    f""
                                 ]
                                 
-                                if folder_name:
-                                    status_lines.append(f"📁 {folder_name}")
+                                # Worker header
+                                status_lines.append(f"⚙️ **Worker {worker_id}:**")
                                 
+                                # Smart folder/filename display
+                                # Don't show folder if it's very similar to filename (common for audiobooks)
+                                show_folder = False
+                                if folder_name:
+                                    # Check if folder name is substantially different from filename
+                                    # Remove file extension for comparison
+                                    filename_no_ext = os.path.splitext(filename)[0]
+                                    if folder_name.lower() != filename_no_ext.lower()[:len(folder_name)]:
+                                        show_folder = True
+                                
+                                if show_folder:
+                                    status_lines.append(f"📁 {folder_name[:35]}")
+                                
+                                # Show filename (truncate smartly)
+                                if len(filename) > 45:
+                                    status_lines.append(f"📄 {filename[:45]}...")
+                                else:
+                                    status_lines.append(f"📄 {filename}")
+                                
+                                # File progress
                                 status_lines.extend([
-                                    f"📄 `{filename[:40]}...`",
                                     f"💾 {format_size(current_bytes)} / {format_size(file_size)}",
                                     f"",
                                     f"{progress_bar}",
-                                    f"⚡ Speed: {format_size(drive_speed)}/s",
-                                    f"⏱️ ETA: {eta_str}"
+                                    f"⚡ {format_size(drive_speed)}/s | ⏱️ {eta_str}"
                                 ])
                                 
                                 try:
@@ -1589,20 +1608,37 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
                                 f"━━━━━━━━━━━━━━━",
                                 f"📊 Overall: {completed}/{total_files}",
                                 f"✅ Success: {successful} | ❌ Failed: {failed}",
-                                f"",
-                                f"🔄 **Worker {worker_id}:**"
+                                f""
                             ]
                             
-                            if folder_name:
-                                status_lines.append(f"📁 {folder_name}")
+                            # Worker header
+                            status_lines.append(f"⚙️ **Worker {worker_id}:**")
                             
+                            # Smart folder/filename display
+                            # Don't show folder if it's very similar to filename (common for audiobooks)
+                            show_folder = False
+                            if folder_name:
+                                # Check if folder name is substantially different from filename
+                                # Remove file extension for comparison
+                                filename_no_ext = os.path.splitext(filename)[0]
+                                if folder_name.lower() != filename_no_ext.lower()[:len(folder_name)]:
+                                    show_folder = True
+                            
+                            if show_folder:
+                                status_lines.append(f"📁 {folder_name[:35]}")
+                            
+                            # Show filename (truncate smartly)
+                            if len(filename) > 45:
+                                status_lines.append(f"📄 {filename[:45]}...")
+                            else:
+                                status_lines.append(f"📄 {filename}")
+                            
+                            # Upload progress
                             status_lines.extend([
-                                f"📄 `{filename[:40]}...`",
                                 f"💾 {format_size(current)} / {format_size(total)}",
                                 f"",
                                 f"{progress_bar}",
-                                f"⚡ Speed: {speed_str}",
-                                f"⏱️ ETA: {eta_str}"
+                                f"⚡ {speed_str} | ⏱️ {eta_str}"
                             ])
                             
                             try:
