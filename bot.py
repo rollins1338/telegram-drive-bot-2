@@ -420,6 +420,25 @@ def format_time(seconds):
         mins = int((seconds%3600)/60)
         return f"{hours}h {mins}m"
 
+async def safe_edit_message(message, text, **kwargs):
+    """Safely edit message with timeout and error handling to prevent freezing"""
+    try:
+        await asyncio.wait_for(
+            message.edit_text(text, **kwargs),
+            timeout=5.0
+        )
+        return True
+    except asyncio.TimeoutError:
+        logger.warning("Message edit timed out - continuing")
+        return False
+    except FloodWait as e:
+        logger.warning(f"FloodWait {e.value}s on message edit")
+        await asyncio.sleep(e.value)
+        return False
+    except Exception as e:
+        logger.debug(f"Message edit error: {e}")
+        return False
+
 # ==================== GOOGLE DRIVE DOWNLOAD FUNCTIONS ====================
 def extract_file_id_from_url(url):
     """Extract Google Drive file ID from various URL formats"""
@@ -830,11 +849,10 @@ def build_browser_keyboard(user_id, folders, files, total_items):
         
         keyboard.append(selection_row)
     else:
-        # NEW: Show "Select All" when nothing is selected
+        # MERGED: Single "Select All" button - selects EVERYTHING (files + folders)
         if total_items > 0:
             keyboard.append([
-                InlineKeyboardButton("☑️ Select All on Page", callback_data="browser_select_page"),
-                InlineKeyboardButton("☑️ Select All Files", callback_data="browser_select_all_files")
+                InlineKeyboardButton("☑️ Select All", callback_data="browser_select_all")
             ])
     
     # Utility row
@@ -1111,7 +1129,8 @@ async def download_from_drive_task(client, status_msg, file_ids, service):
                 ])
                 
                 # Update status
-                await status_msg.edit_text(
+                await safe_edit_message(
+                    status_msg,
                     f"📥 **Downloading from Drive ({idx}/{total_files})**\n"
                     f"📄 `{filename[:50]}...`\n"
                     f"💾 Size: {format_size(file_size)}\n"
@@ -1181,28 +1200,22 @@ async def download_from_drive_task(client, status_msg, file_ids, service):
                             
                             progress_bar = create_progress_bar(progress, length=12)
                             
-                            try:
-                                await status_msg.edit_text(
-                                    f"📥 **Downloading from Drive ({idx}/{total_files})**\n"
-                                    f"📄 `{filename[:45]}...`\n"
-                                    f"💾 Size: {format_size(file_size)}\n\n"
-                                    f"{progress_bar}\n"
-                                    f"⚡ Speed: {format_size(speed)}/s\n"
-                                    f"⏱️ ETA: {eta_str}\n\n"
-                                    f"✅ {successful} | ❌ {failed}"
-                                )
-                            except FloodWait as e:
-                                logger.warning(f"FloodWait during download: {e.value}s")
-                                await asyncio.sleep(e.value)
-                            except Exception as e:
-                                # Ignore other update errors to avoid breaking download
-                                logger.debug(f"Status update error (non-critical): {e}")
-                                pass
+                            await safe_edit_message(
+                                status_msg,
+                                f"📥 **Downloading from Drive ({idx}/{total_files})**\n"
+                                f"📄 `{filename[:45]}...`\n"
+                                f"💾 Size: {format_size(file_size)}\n\n"
+                                f"{progress_bar}\n"
+                                f"⚡ Speed: {format_size(speed)}/s\n"
+                                f"⏱️ ETA: {eta_str}\n\n"
+                                f"✅ {successful} | ❌ {failed}"
+                            )
                 
                 fh.close()
                 
                 # Send to Telegram
-                await status_msg.edit_text(
+                await safe_edit_message(
+                    status_msg,
                     f"📤 **Sending to Telegram ({idx}/{total_files})**\n"
                     f"📄 `{filename[:50]}...`\n"
                     f"💾 Size: {format_size(file_size)}\n"
@@ -1933,6 +1946,7 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
     upload_parent = parent_folder_id if parent_folder_id else DRIVE_FOLDER_ID
     
     task_id = f"{status_msg.chat.id}_{status_msg.id}"
+    start_time = time.time()  # Track upload start time
     ACTIVE_TASKS[task_id] = {
         'cancelled': False, 
         'files_list': file_list,
@@ -2251,8 +2265,18 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
         
         # Status updater task - updates message with all active workers
         async def status_updater():
+            last_update = 0
+            update_interval = 2  # Update every 2 seconds to avoid FloodWait
+            
             while not upload_state['stop_updater']:
                 try:
+                    current_time = time.time()
+                    
+                    # Only update if enough time has passed
+                    if current_time - last_update < update_interval:
+                        await asyncio.sleep(0.5)
+                        continue
+                    
                     async with upload_state['lock']:
                         completed = upload_state['completed']
                         successful = upload_state['successful_uploads']
@@ -2302,20 +2326,16 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
                             status_lines.extend(worker_lines)
                             status_lines.append("")  # Empty line between workers
                     
-                    # Update message
-                    try:
-                        await status_msg.edit_text("\n".join(status_lines))
-                    except FloodWait as e:
-                        await asyncio.sleep(e.value)
-                    except:
-                        pass
+                    # Update message with timeout protection
+                    await safe_edit_message(status_msg, "\n".join(status_lines))
+                    last_update = current_time
                     
-                    # Update every 1 second
-                    await asyncio.sleep(1)
+                    # Sleep before next update
+                    await asyncio.sleep(0.5)
                     
                 except Exception as e:
-                    logger.debug(f"Status updater error: {e}")
-                    await asyncio.sleep(1)
+                    logger.error(f"Status updater critical error: {e}")
+                    await asyncio.sleep(2)
         
         # Start 2 concurrent workers
         worker_tasks = [
@@ -3063,17 +3083,13 @@ async def handle_callback(client, query):
                 await query.answer("✅ Selection cleared", show_alert=False)
             
             # NEW: Select all files on current page
-            elif query.data == "browser_select_page":
+            # MERGED: Select ALL items (files + folders) in current folder
+            elif query.data == "browser_select_all":
                 folders, files, _ = list_drive_files(service, session['current_folder'])
-                page = session.get('page', 0)
-                start_idx = page * ITEMS_PER_PAGE
-                end_idx = start_idx + ITEMS_PER_PAGE
                 
+                # Select EVERYTHING - both files and folders
                 all_items = folders + files
-                page_items = all_items[start_idx:end_idx]
-                
-                # Add all items on page to selection
-                for item in page_items:
+                for item in all_items:
                     if item['id'] not in session['selected_files']:
                         session['selected_files'].append(item['id'])
                 
@@ -3081,34 +3097,14 @@ async def handle_callback(client, query):
                 keyboard = build_browser_keyboard(user_id, folders, files, total_items)
                 breadcrumb = get_breadcrumb(session)
                 
-                await query.message.edit_text(
+                await safe_edit_message(
+                    query.message,
                     f"📁 **File Browser**\n"
                     f"📍 {breadcrumb}\n"
                     f"📊 {len(folders)} folders, {len(files)} files",
                     reply_markup=keyboard
                 )
-                await query.answer(f"✅ Selected {len(page_items)} items", show_alert=False)
-            
-            # NEW: Select all files (only files, not folders) in current folder
-            elif query.data == "browser_select_all_files":
-                folders, files, _ = list_drive_files(service, session['current_folder'])
-                
-                # Add all files (not folders) to selection
-                for file in files:
-                    if file['id'] not in session['selected_files']:
-                        session['selected_files'].append(file['id'])
-                
-                total_items = len(folders) + len(files)
-                keyboard = build_browser_keyboard(user_id, folders, files, total_items)
-                breadcrumb = get_breadcrumb(session)
-                
-                await query.message.edit_text(
-                    f"📁 **File Browser**\n"
-                    f"📍 {breadcrumb}\n"
-                    f"📊 {len(folders)} folders, {len(files)} files",
-                    reply_markup=keyboard
-                )
-                await query.answer(f"✅ Selected {len(files)} files", show_alert=False)
+                await query.answer(f"✅ Selected {len(all_items)} items", show_alert=False)
             
             # Back button
             elif query.data == "browser_back":
@@ -3413,8 +3409,8 @@ async def handle_callback(client, query):
                 await query.answer("❌ Failed to connect to Drive", show_alert=True)
                 return
             
-            # Update session
-            session = BROWSER_SESSIONS[user_id]
+            # Initialize or get session
+            session = get_browser_session(user_id)
             
             # Get folder info
             try:
@@ -3481,7 +3477,7 @@ async def handle_callback(client, query):
             key = pending.get('key')
             
             # Get breadcrumb for confirmation
-            session = BROWSER_SESSIONS[user_id]
+            session = get_browser_session(user_id)
             breadcrumb = get_breadcrumb(session)
             
             # Clean up
