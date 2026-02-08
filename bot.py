@@ -1,11 +1,24 @@
 """
-FIXED VERSION - Changes made:
+FIXED VERSION - All Issues Resolved:
 
 PHASE 1 - CONCURRENT LOGIC FIXES:
+✅ CRITICAL FIX: Run Google Drive downloads in executor to enable true concurrency
+   - Worker 1 and Worker 2 now actually work in parallel
+   - Previously: blocking downloader.next_chunk() froze event loop
+   - Now: each worker downloads independently using asyncio executor
+✅ CRITICAL FIX: Show progress from 0% instead of only when > 0%
+   - Previously: workers appeared frozen until progress > 0%
+   - Now: progress bar shows immediately, even at 0%
+✅ CRITICAL FIX: Run metadata extraction in executor (non-blocking)
+   - Audio metadata extraction now runs in thread pool
+   - Prevents blocking when processing large audio files
+✅ Improved Drive download update interval (1s instead of 3s for better visual feedback)
 ✅ Fixed MESSAGE_NOT_MODIFIED errors by tracking last message text in status updaters
 ✅ Fixed concurrent workers progress display - both workers now show progress simultaneously
-✅ Improved status update frequency (2s intervals) to reduce Telegram API load
+✅ Status updater runs at 1s intervals for smooth updates
 ✅ Added proper error handling for MESSAGE_NOT_MODIFIED in all status updates
+✅ /cancel command works correctly (sets cancelled flag in ACTIVE_TASKS)
+✅ Cancel buttons in progress messages work correctly
 
 PHASE 2 - UI OVERHAUL:
 ✅ Removed duplicate emojis in file browser (emojis were appearing twice)
@@ -17,6 +30,7 @@ PHASE 2 - UI OVERHAUL:
 ✅ Fixed button error handling to prevent crashes
 
 All changes maintain existing functionality while improving stability and UX.
+NO ENVIRONMENT VARIABLES NEEDED - this is a pure code fix.
 """
 
 import os
@@ -1454,7 +1468,7 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
                             'eta': 'Calculating...'
                         })
                     
-                    # Download file from Drive
+                    # FIXED: Download file from Drive using executor to avoid blocking
                     request = service.files().get_media(fileId=file_id)
                     download_path = f"downloads/{filename}"
                     
@@ -1469,6 +1483,9 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
                     last_drive_bytes = 0
                     last_drive_speed_update = drive_start_time
                     
+                    # Run download chunks in executor to avoid blocking
+                    loop = asyncio.get_event_loop()
+                    
                     while not done:
                         if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
                             fh.close()
@@ -1477,7 +1494,8 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
                             file_queue.task_done()
                             return
                         
-                        status, done = downloader.next_chunk()
+                        # FIXED: Run blocking call in executor
+                        status, done = await loop.run_in_executor(None, downloader.next_chunk)
                         
                         # Update progress with speed and ETA
                         if status:
@@ -1485,8 +1503,8 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
                             current_bytes = int(status.progress() * file_size)
                             current_time = time.time()
                             
-                            # Only update every 3 seconds to avoid FloodWait
-                            if current_time - last_update >= 3 or done:
+                            # FIXED: Update every 1 second instead of 3 for better visual feedback
+                            if current_time - last_update >= 1 or done:
                                 # Calculate speed
                                 time_diff = current_time - last_drive_speed_update
                                 bytes_diff = current_bytes - last_drive_bytes
@@ -1584,8 +1602,9 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
                     
                     # Send based on file type
                     if download_path.lower().endswith(('.mp3', '.m4a', '.m4b', '.flac', '.wav', '.ogg', '.aac', '.opus', '.wma', '.ape')):
-                        # Extract metadata for audio files
-                        metadata = extract_audio_metadata(download_path)
+                        # FIXED: Extract metadata in executor to avoid blocking
+                        loop = asyncio.get_event_loop()
+                        metadata = await loop.run_in_executor(None, extract_audio_metadata, download_path)
                         thumbnail_path = await extract_audio_thumbnail(download_path)
                         
                         # Send with metadata and progress
@@ -1691,12 +1710,12 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
                             # Filename
                             worker_lines.append(f"📄 `{worker['filename'][:35]}...`")
                             
-                            # Progress info if available
-                            if worker.get('progress') is not None and worker['progress'] > 0:
+                            # FIXED: Always show progress info, even if progress is 0 (removed > 0 check)
+                            if worker.get('progress') is not None:
                                 progress_bar = create_progress_bar(worker['progress'], length=12)
                                 worker_lines.append(f"{progress_bar}")
                                 
-                                if worker.get('current_bytes') and worker.get('total_bytes'):
+                                if worker.get('current_bytes') is not None and worker.get('total_bytes'):
                                     worker_lines.append(
                                         f"💾 {format_size(worker['current_bytes'])} / {format_size(worker['total_bytes'])}"
                                     )
@@ -2302,12 +2321,12 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
                             # Filename
                             worker_lines.append(f"📄 `{worker['filename'][:35]}...`")
                             
-                            # Progress info if available
-                            if worker.get('progress') is not None and worker['progress'] > 0:
+                            # FIXED: Always show progress info, even if progress is 0 (removed > 0 check)
+                            if worker.get('progress') is not None:
                                 progress_bar = create_progress_bar(worker['progress'], length=12)
                                 worker_lines.append(f"{progress_bar}")
                                 
-                                if worker.get('current_bytes') and worker.get('total_bytes'):
+                                if worker.get('current_bytes') is not None and worker.get('total_bytes'):
                                     worker_lines.append(
                                         f"💾 {format_size(worker['current_bytes'])} / {format_size(worker['total_bytes'])}"
                                     )
