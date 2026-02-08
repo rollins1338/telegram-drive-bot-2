@@ -16,7 +16,7 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload, MediaIoBa
 from googleapiclient.errors import HttpError
 import logging
 
-# Configure logging
+# Configure logging FIRST before using it
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -92,15 +92,6 @@ ALBUMS = {}
 TEMP_FILES = {}
 ACTIVE_SERIES = {}
 ACTIVE_TASKS = {}  # Track active upload tasks for cancellation
-
-# Concurrency limits (file pipelines)
-DEFAULT_CONCURRENCY = int(os.getenv("FILE_CONCURRENCY", "2"))
-DRIVE_TO_TG_CONCURRENCY = int(os.getenv("DRIVE_TO_TG_CONCURRENCY", str(DEFAULT_CONCURRENCY)))
-TG_TO_DRIVE_CONCURRENCY = int(os.getenv("TG_TO_DRIVE_CONCURRENCY", str(DEFAULT_CONCURRENCY)))
-
-DRIVE_TO_TG_SEMAPHORE = asyncio.Semaphore(DRIVE_TO_TG_CONCURRENCY)  # Drive -> Telegram
-TG_TO_DRIVE_SEMAPHORE = asyncio.Semaphore(TG_TO_DRIVE_CONCURRENCY)  # Telegram -> Drive
-
 
 # Queue Management
 UPLOAD_QUEUE = {}  # Format: {queue_id: {'files': [], 'series_name': str, 'flat_upload': bool, 'status': str, 'created_at': float}}
@@ -849,6 +840,13 @@ def build_browser_keyboard(user_id, folders, files, total_items):
         )
         
         keyboard.append(selection_row)
+    else:
+        # NEW: Show "Select All" when nothing is selected
+        if total_items > 0:
+            keyboard.append([
+                InlineKeyboardButton("☑️ Select All on Page", callback_data="browser_select_page"),
+                InlineKeyboardButton("☑️ Select All Files", callback_data="browser_select_all_files")
+            ])
     
     # Utility row
     utility_row = []
@@ -998,10 +996,7 @@ def extract_audio_metadata(file_path):
         
         # Album
         if 'album' in audio:
-            if isinstance(audio['album'], list) and len(audio['album']) > 0:
-                metadata['album'] = str(audio['album'][0])
-            else:
-                metadata['album'] = str(audio['album'])
+            metadata['album'] = str(audio['album'][0]) if isinstance(audio['album'], list) else str(audio['album'])
         
         # Duration
         if hasattr(audio.info, 'length'):
@@ -1043,10 +1038,7 @@ async def extract_audio_thumbnail(file_path):
                     thumb_data = pics[0].data
             # MP4/M4A
             elif 'covr' in audio.tags:
-                if isinstance(audio.tags['covr'], list) and len(audio.tags['covr']) > 0:
-                    thumb_data = bytes(audio.tags['covr'][0])
-                else:
-                    thumb_data = bytes(audio.tags['covr'])
+                thumb_data = bytes(audio.tags['covr'][0])
         
         # Save thumbnail if found
         if thumb_data:
@@ -1107,100 +1099,101 @@ async def download_from_drive_task(client, status_msg, file_ids, service):
                 ACTIVE_TASKS[task_id]['current_file'] = filename
                 ACTIVE_TASKS[task_id]['progress'] = int((idx - 1) / total_files * 100)
                 
+                # ADD: Cancel button for downloads
+                cancel_button = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🛑 Cancel Download", callback_data=f"cancel_{task_id}")]
+                ])
+                
                 # Update status
                 await status_msg.edit_text(
                     f"📥 **Downloading from Drive ({idx}/{total_files})**\n"
                     f"📄 `{filename[:50]}...`\n"
                     f"💾 Size: {format_size(file_size)}\n"
-                    f"✅ {successful} | ❌ {failed}"
+                    f"✅ {successful} | ❌ {failed}",
+                    reply_markup=cancel_button
                 )
                 
-                # Download file from Drive using robust worker logic
+                # Download file from Drive
+                request = service.files().get_media(fileId=file_id)
                 download_path = f"downloads/{filename}"
+                
                 os.makedirs("downloads", exist_ok=True)
                 
-                progress_state = {
-                    "done": False,
-                    "error": None,
-                    "pct": 0,
-                    "bytes": 0,
-                    "speed": 0.0,
-                    "eta": "Calculating...",
-                }
-
-                def _drive_download_worker():
-                    try:
-                        svc = get_drive_service()
-                        if not svc:
-                            raise Exception("Failed to connect to Google Drive")
-                        req = svc.files().get_media(fileId=file_id)
-                        with io.FileIO(download_path, "wb") as fh:
-                            downloader = MediaIoBaseDownload(fh, req)
-                            done_local = False
-                            last_t = time.time()
-                            last_b = 0
-                            while not done_local:
-                                if ACTIVE_TASKS.get(task_id, {}).get("cancelled", False):
-                                    raise Exception("Cancelled")
-                                status, done_local = downloader.next_chunk()
-                                if status and file_size:
-                                    pct = int(status.progress() * 100)
-                                    cur_b = int(status.progress() * file_size)
-                                    now = time.time()
-                                    dt = max(now - last_t, 1e-6)
-                                    db = cur_b - last_b
-                                    spd = db / dt
-                                    progress_state["pct"] = pct
-                                    progress_state["bytes"] = cur_b
-                                    progress_state["speed"] = spd
-                                    if spd > 0 and cur_b < file_size:
-                                        progress_state["eta"] = format_time((file_size - cur_b) / spd)
-                                    else:
-                                        progress_state["eta"] = "Done" if cur_b >= file_size else "Calculating..."
-                                    last_t = now
-                                    last_b = cur_b
-                        progress_state["done"] = True
-                    except Exception as e:
-                        progress_state["error"] = str(e)
-                        progress_state["done"] = True
-
-                loop = asyncio.get_running_loop()
-                download_future = loop.run_in_executor(None, _drive_download_worker)
-
-                last_update = 0.0
-                while not progress_state["done"]:
+                fh = io.FileIO(download_path, 'wb')
+                downloader = MediaIoBaseDownload(fh, request)
+                
+                done = False
+                last_update = 0  # Track last update time to avoid FloodWait
+                start_time = time.time()  # Track download start time for speed/ETA
+                last_progress_bytes = 0  # Track bytes for speed calculation
+                last_speed_update = start_time  # Track last speed update time
+                
+                while not done:
+                    # Check for cancellation
                     if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
-                        break
-                    now = time.time()
-                    if now - last_update >= 3.0: # Match 3s throttle
-                        last_update = now
-                        progress = int(progress_state.get("pct", 0) or 0)
-                        current_bytes = int(progress_state.get("bytes", 0) or 0)
-                        drive_speed = float(progress_state.get("speed", 0.0) or 0.0)
-                        eta_str = progress_state.get("eta", "Calculating...")
-                        progress_bar = create_progress_bar(progress, length=12)
-
-                        try:
-                            await status_msg.edit_text(
-                                f"📥 **Downloading from Drive ({idx}/{total_files})**\n"
-                                f"📄 `{filename[:45]}...`\n"
-                                f"💾 {format_size(current_bytes)} / {format_size(file_size)}\n\n"
-                                f"{progress_bar}\n"
-                                f"⚡ Speed: {format_size(drive_speed)}/s\n"
-                                f"⏱️ ETA: {eta_str}\n\n"
-                                f"✅ {successful} | ❌ {failed}"
-                            )
-                        except FloodWait as e:
-                            await asyncio.sleep(float(str(e.value)))
-                        except Exception:
-                            pass
-                    await asyncio.sleep(0.5)
-
-                await download_future
-                if progress_state.get("error"):
-                    if os.path.exists(download_path):
-                        os.remove(download_path)
-                    raise Exception(progress_state["error"])
+                        fh.close()
+                        if os.path.exists(download_path):
+                            os.remove(download_path)
+                        await status_msg.edit_text(
+                            f"🛑 **Download Cancelled**\n\n"
+                            f"✅ Downloaded: {successful}/{total_files}\n"
+                            f"❌ Failed: {failed}"
+                        )
+                        return
+                    
+                    status, done = downloader.next_chunk()
+                    
+                    # Update progress with visual bar, speed, and ETA
+                    if status:
+                        progress = int(status.progress() * 100)
+                        current_bytes = int(status.progress() * file_size)
+                        current_time = time.time()
+                        
+                        # Only update every 3 seconds to avoid FloodWait
+                        if current_time - last_update >= 3 or done:
+                            # Calculate speed (bytes per second)
+                            time_diff = current_time - last_speed_update
+                            bytes_diff = current_bytes - last_progress_bytes
+                            
+                            if time_diff > 0:
+                                speed = bytes_diff / time_diff  # bytes per second
+                            else:
+                                speed = 0
+                            
+                            # Calculate ETA
+                            if speed > 0 and current_bytes < file_size:
+                                remaining_bytes = file_size - current_bytes
+                                eta_seconds = remaining_bytes / speed
+                                eta_str = format_time(eta_seconds)
+                            else:
+                                eta_str = "Calculating..." if current_bytes < file_size else "Done"
+                            
+                            # Update tracking variables
+                            last_update = current_time
+                            last_speed_update = current_time
+                            last_progress_bytes = current_bytes
+                            
+                            progress_bar = create_progress_bar(progress, length=12)
+                            
+                            try:
+                                await status_msg.edit_text(
+                                    f"📥 **Downloading from Drive ({idx}/{total_files})**\n"
+                                    f"📄 `{filename[:45]}...`\n"
+                                    f"💾 Size: {format_size(file_size)}\n\n"
+                                    f"{progress_bar}\n"
+                                    f"⚡ Speed: {format_size(speed)}/s\n"
+                                    f"⏱️ ETA: {eta_str}\n\n"
+                                    f"✅ {successful} | ❌ {failed}"
+                                )
+                            except FloodWait as e:
+                                logger.warning(f"FloodWait during download: {e.value}s")
+                                await asyncio.sleep(e.value)
+                            except Exception as e:
+                                # Ignore other update errors to avoid breaking download
+                                logger.debug(f"Status update error (non-critical): {e}")
+                                pass
+                
+                fh.close()
                 
                 # Send to Telegram
                 await status_msg.edit_text(
@@ -1379,217 +1372,199 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
         total_files = len(uploadable_files)
         ACTIVE_TASKS[task_id]['files_list'] = [f['id'] for f in uploadable_files]
         
-        # Upload each file
-        # Run items with limited concurrency (2 by default)
-        semaphore = DRIVE_TO_TG_SEMAPHORE
-
-        async def _run_one(idx, file_meta):
-            nonlocal successful, failed
-            async with semaphore:
-                # Check for cancellation
+        # Shared state for concurrent workers
+        upload_state = {
+            'successful': 0,
+            'failed': 0,
+            'completed': 0,
+            'lock': asyncio.Lock(),
+            'active_workers': [],
+            'stop_updater': False
+        }
+        
+        # Create queue for files
+        file_queue = asyncio.Queue()
+        for file_meta in uploadable_files:
+            await file_queue.put(file_meta)
+        
+        # Worker function
+        async def upload_worker(worker_id):
+            while True:
+                # Check for cancellation FIRST before pulling from queue
                 if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
-                    await status_msg.edit_text(
-                        f"🛑 **Upload Cancelled**\n\n"
-                        f"✅ Sent: {successful}/{total_files}\n"
-                        f"❌ Failed: {failed}"
-                    )
-                    return
-
+                    break
+                
+                try:
+                    # Get next file from queue with timeout
+                    file_meta = await asyncio.wait_for(file_queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    # Queue is empty or timeout - check cancellation then exit
+                    if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
+                        break
+                    # Queue is empty, worker can exit
+                    break
+                
+                # Double-check for cancellation after getting file
+                if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
+                    file_queue.task_done()
+                    break
+                
                 try:
                     file_id = file_meta['id']
                     filename = file_meta['name']
                     mime_type = file_meta.get('mimeType', '')
                     file_size = int(file_meta.get('size', 0))
                     folder_name = file_meta.get('folder_name', None)
-    
-                    ACTIVE_TASKS[task_id]['current_file'] = filename
-                    ACTIVE_TASKS[task_id]['progress'] = int((idx - 1) / total_files * 100)
-    
-                    # Update status
-                    status_text = (
-                        f"📤 **Uploading to Telegram ({idx}/{total_files})**\n"
-                    )
-                    if folder_name:
-                        status_text += f"📁 Folder: {folder_name}\n"
-                    status_text += (
-                        f"📄 `{filename[:50]}...`\n"
-                        f"💾 Size: {format_size(file_size)}\n"
-                        f"✅ {successful} | ❌ {failed}"
-                    )
-    
-                    try:
-                        await status_msg.edit_text(status_text)
-                    except Exception as e:
-                        logger.debug(f"Initial status update error: {e}")
-    
-                    # Download file from Drive with progress bar
+                    
+                    # Add to active workers
+                    async with upload_state['lock']:
+                        upload_state['active_workers'].append({
+                            'worker_id': worker_id,
+                            'filename': filename,
+                            'folder': folder_name,
+                            'stage': 'downloading',
+                            'progress': 0,
+                            'current_bytes': 0,
+                            'total_bytes': file_size,
+                            'speed': 0,
+                            'eta': 'Calculating...'
+                        })
+                    
+                    # Download file from Drive
                     request = service.files().get_media(fileId=file_id)
                     download_path = f"downloads/{filename}"
+                    
                     os.makedirs("downloads", exist_ok=True)
-
-                    progress_state = {
-                        "done": False,
-                        "error": None,
-                        "pct": 0,
-                        "bytes": 0,
-                        "speed": 0.0,
-                        "eta": "Calculating...",
-                    }
-
-                    def _drive_download_worker():
-                        try:
-                            svc = get_drive_service()
-                            if not svc:
-                                raise Exception("Failed to connect to Google Drive")
-                            req = svc.files().get_media(fileId=file_id)
-                            with io.FileIO(download_path, "wb") as fh:
-                                downloader = MediaIoBaseDownload(fh, req)
-                                done_local = False
-                                last_t = time.time()
-                                last_b = 0
-                                while not done_local:
-                                    if ACTIVE_TASKS.get(task_id, {}).get("cancelled", False):
-                                        raise Exception("Cancelled")
-                                    status, done_local = downloader.next_chunk()
-                                    if status and file_size:
-                                        pct = int(status.progress() * 100)
-                                        cur_b = int(status.progress() * file_size)
-                                        now = time.time()
-                                        dt = max(now - last_t, 1e-6)
-                                        db = cur_b - last_b
-                                        spd = db / dt
-                                        progress_state["pct"] = pct
-                                        progress_state["bytes"] = cur_b
-                                        progress_state["speed"] = spd
-                                        if spd > 0 and cur_b < file_size:
-                                            progress_state["eta"] = format_time((file_size - cur_b) / spd)
-                                        else:
-                                            progress_state["eta"] = "Done" if cur_b >= file_size else "Calculating..."
-                                        last_t = now
-                                        last_b = cur_b
-                            progress_state["done"] = True
-                        except Exception as e:
-                            progress_state["error"] = str(e)
-                            progress_state["done"] = True
-
-                    loop = asyncio.get_running_loop()
-                    download_future = loop.run_in_executor(None, _drive_download_worker)
-
-                    last_update = 0.0
-                    while not progress_state["done"]:
+                    
+                    fh = io.FileIO(download_path, 'wb')
+                    downloader = MediaIoBaseDownload(fh, request)
+                    
+                    done = False
+                    last_update = 0
+                    drive_start_time = time.time()
+                    last_drive_bytes = 0
+                    last_drive_speed_update = drive_start_time
+                    
+                    while not done:
                         if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
-                            break
-                        now = time.time()
-                        if now - last_update >= 1.0:
-                            last_update = now
-                            progress = int(progress_state.get("pct", 0) or 0)
-                            current_bytes = int(progress_state.get("bytes", 0) or 0)
-                            drive_speed = float(progress_state.get("speed", 0.0) or 0.0)
-                            eta_str = progress_state.get("eta", "Calculating...")
-                            progress_bar = create_progress_bar(progress, length=12)
-
-                            drive_status = (f"📥 **Downloading from Drive ({idx}/{total_files})**\n")
-                            if folder_name:
-                                drive_status += f"📁 Folder: {folder_name}\n"
-                            drive_status += (
-                                f"📄 `{filename[:45]}...`\n"
-                                f"💾 {format_size(current_bytes)} / {format_size(file_size)}\n\n"
-                                f"{progress_bar}\n"
-                                f"⚡ Speed: {format_size(drive_speed)}/s\n"
-                                f"⏱️ ETA: {eta_str}\n\n"
-                                f"✅ {successful} | ❌ {failed}"
-                            )
-
-                            try:
-                                await status_msg.edit_text(drive_status)
-                            except FloodWait as e:
-                                await asyncio.sleep(float(str(e.value)))
-                            except Exception:
-                                pass
-                        await asyncio.sleep(0.2)
-
-                    await download_future
-
-                    if progress_state.get("error"):
-                        try:
+                            fh.close()
                             if os.path.exists(download_path):
                                 os.remove(download_path)
-                        except Exception:
-                            pass
-                        raise Exception(progress_state["error"])
-
-                    # Send to Telegram with progress callback
-                    # Prepare caption based on file type and folder context
+                            file_queue.task_done()
+                            return
+                        
+                        status, done = downloader.next_chunk()
+                        
+                        # Update progress with speed and ETA
+                        if status:
+                            progress = int(status.progress() * 100)
+                            current_bytes = int(status.progress() * file_size)
+                            current_time = time.time()
+                            
+                            # Only update every 3 seconds to avoid FloodWait
+                            if current_time - last_update >= 3 or done:
+                                # Calculate speed
+                                time_diff = current_time - last_drive_speed_update
+                                bytes_diff = current_bytes - last_drive_bytes
+                                
+                                if time_diff > 0:
+                                    drive_speed = bytes_diff / time_diff
+                                else:
+                                    drive_speed = 0
+                                
+                                # Calculate ETA
+                                if drive_speed > 0 and current_bytes < file_size:
+                                    remaining_bytes = file_size - current_bytes
+                                    eta_seconds = remaining_bytes / drive_speed
+                                    eta_str = format_time(eta_seconds)
+                                else:
+                                    eta_str = "Calculating..." if current_bytes < file_size else "Done"
+                                
+                                # Update tracking
+                                last_update = current_time
+                                last_drive_speed_update = current_time
+                                last_drive_bytes = current_bytes
+                                
+                                # Update worker state
+                                async with upload_state['lock']:
+                                    for worker in upload_state['active_workers']:
+                                        if worker['worker_id'] == worker_id:
+                                            worker['progress'] = progress
+                                            worker['current_bytes'] = current_bytes
+                                            worker['total_bytes'] = file_size
+                                            worker['speed'] = int(drive_speed)
+                                            worker['eta'] = eta_str
+                                            break
+                    
+                    fh.close()
+                    
+                    # Update worker stage to uploading and reset progress
+                    async with upload_state['lock']:
+                        for worker in upload_state['active_workers']:
+                            if worker['worker_id'] == worker_id:
+                                worker['stage'] = 'uploading'
+                                worker['progress'] = 0
+                                worker['current_bytes'] = 0
+                                worker['speed'] = 0
+                                worker['eta'] = 'Starting...'
+                                break
+                    
+                    # Send to Telegram with progress tracking
                     mime_type = file_meta.get('mimeType', '')
                     is_audio = download_path.lower().endswith(('.mp3', '.m4a', '.m4b', '.flac', '.wav', '.ogg', '.aac', '.opus', '.wma', '.ape'))
                     is_video = download_path.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm', '.wmv', '.flv', '.3gp')) or 'video' in mime_type
-    
+                    
                     # Set caption
                     if is_video:
-                        caption = None  # No caption for videos
+                        caption = None
                     elif is_audio and folder_name:
-                        caption = f"📖 {folder_name}"  # Only folder name with book emoji for audio
-                        logger.info(f"Setting audio caption from folder: {caption}")
+                        caption = f"📖 {folder_name}"
                     elif is_audio:
-                        caption = filename  # Just filename for standalone audio
-                        logger.info(f"Setting audio caption from filename: {caption}")
+                        caption = filename
                     else:
-                        caption = filename  # Default for other types
-    
+                        caption = filename
+                    
                     # Progress callback for Telegram upload
                     upload_start_time = time.time()
                     last_progress_update = 0
-    
+                    
                     async def progress_callback(current, total):
                         nonlocal last_progress_update
                         current_time = time.time()
-        
+                        
                         # Update every 2 seconds to avoid FloodWait
                         if current_time - last_progress_update >= 2:
                             last_progress_update = current_time
-            
-                            progress_pct = int((current / total) * 100) if total > 0 else 0
-                            progress_bar = create_progress_bar(progress_pct, length=12)
-            
+                            
                             # Calculate speed
                             elapsed = current_time - upload_start_time
                             speed = current / elapsed if elapsed > 0 else 0
-                            speed_str = f"{format_size(int(speed))}/s"
-            
+                            
                             # Calculate ETA
                             remaining = total - current
                             eta = remaining / speed if speed > 0 else 0
                             eta_str = format_time(int(eta))
-            
-                            upload_status = (
-                                f"📤 **Uploading to Telegram ({idx}/{total_files})**\n"
-                            )
-                            if folder_name:
-                                upload_status += f"📁 Folder: {folder_name}\n"
-                            upload_status += (
-                                f"📄 `{filename[:45]}...`\n"
-                                f"💾 {format_size(current)} / {format_size(total)}\n"
-                                f"🚀 Speed: {speed_str} | ⏱️ ETA: {eta_str}\n\n"
-                                f"{progress_bar}\n\n"
-                                f"✅ {successful} | ❌ {failed}"
-                            )
-            
-                            try:
-                                await status_msg.edit_text(upload_status)
-                            except FloodWait as e:
-                                logger.warning(f"FloodWait during upload: {e.value}s")
-                                await asyncio.sleep(float(str(e.value)))
-                            except Exception as e:
-                                logger.debug(f"Upload progress update error (non-critical): {e}")
-    
-                    # Send based on file type with progress tracking
-                    # IMPORTANT: Check audio extensions first (before MIME) to handle m4b/m4a correctly
+                            
+                            # Update worker state
+                            progress_pct = int((current / total) * 100) if total > 0 else 0
+                            
+                            async with upload_state['lock']:
+                                for worker in upload_state['active_workers']:
+                                    if worker['worker_id'] == worker_id:
+                                        worker['progress'] = progress_pct
+                                        worker['current_bytes'] = current
+                                        worker['total_bytes'] = total
+                                        worker['speed'] = int(speed)
+                                        worker['eta'] = eta_str
+                                        break
+                    
+                    # Send based on file type
                     if download_path.lower().endswith(('.mp3', '.m4a', '.m4b', '.flac', '.wav', '.ogg', '.aac', '.opus', '.wma', '.ape')):
                         # Extract metadata for audio files
                         metadata = extract_audio_metadata(download_path)
                         thumbnail_path = await extract_audio_thumbnail(download_path)
-        
-                        # Send with metadata
+                        
+                        # Send with metadata and progress
                         await client.send_audio(
                             status_msg.chat.id,
                             download_path,
@@ -1600,14 +1575,14 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
                             thumb=thumbnail_path,
                             progress=progress_callback
                         )
-        
+                        
                         # Clean up thumbnail
                         if thumbnail_path and os.path.exists(thumbnail_path):
                             try:
                                 os.remove(thumbnail_path)
                             except:
                                 pass
-                
+                                
                     elif download_path.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm', '.wmv', '.flv', '.3gp')) or 'video' in mime_type:
                         await client.send_video(
                             status_msg.chat.id,
@@ -1629,41 +1604,155 @@ async def upload_to_telegram_task(client, status_msg, folders, files, service):
                             caption=caption,
                             progress=progress_callback
                         )
-    
+                    
                     # Clean up
                     if os.path.exists(download_path):
                         os.remove(download_path)
-    
-                    successful += 1
-                    logger.info(f"✅ Uploaded to Telegram: {filename}")
-    
+                    
+                    async with upload_state['lock']:
+                        upload_state['successful'] += 1
+                        upload_state['completed'] += 1
+                    
+                    logger.info(f"✅ Worker {worker_id} uploaded: {filename}")
+                    
                 except Exception as e:
-                    # Access filename from local scope if defined, else from file_meta
-                    # Access name from file_meta to avoid UnboundLocalError
-                    f_name = file_meta.get('name', 'Unknown')
-                    logger.error(f"❌ Error uploading {f_name}: {e}")
-                    failed += 1
+                    logger.error(f"❌ Worker {worker_id} error on {filename}: {e}")
+                    async with upload_state['lock']:
+                        upload_state['failed'] += 1
+                        upload_state['completed'] += 1
+                
+                finally:
+                    # Remove from active workers
+                    async with upload_state['lock']:
+                        upload_state['active_workers'] = [
+                            w for w in upload_state['active_workers'] 
+                            if w['worker_id'] != worker_id
+                        ]
+                    file_queue.task_done()
         
-
-        tasks = [asyncio.create_task(_run_one(idx, file_meta)) for idx, file_meta in enumerate(uploadable_files, 1)]
-        await asyncio.gather(*tasks)
+        # Status updater task - updates message with all active workers
+        async def status_updater():
+            while not upload_state['stop_updater']:
+                try:
+                    async with upload_state['lock']:
+                        completed = upload_state['completed']
+                        successful = upload_state['successful']
+                        failed = upload_state['failed']
+                        workers = list(upload_state['active_workers'])
+                    
+                    # Build status message with all workers
+                    status_lines = [
+                        f"📤 **Uploading to Telegram**",
+                        f"━━━━━━━━━━━━━━━",
+                        f"📊 Overall: {completed}/{total_files}",
+                        f"✅ Success: {successful} | ❌ Failed: {failed}",
+                        ""
+                    ]
+                    
+                    if workers:
+                        status_lines.append("🔄 **Active Workers:**")
+                        status_lines.append("")
+                        
+                        for worker in workers:
+                            worker_lines = []
+                            stage_icon = "📥" if worker['stage'] == 'downloading' else "📤"
+                            
+                            # Worker header
+                            worker_lines.append(f"{stage_icon} **Worker {worker['worker_id']}:**")
+                            
+                            # Folder if present
+                            if worker.get('folder'):
+                                worker_lines.append(f"📁 {worker['folder'][:30]}")
+                            
+                            # Filename
+                            worker_lines.append(f"📄 `{worker['filename'][:35]}...`")
+                            
+                            # Progress info if available
+                            if worker.get('progress') is not None and worker['progress'] > 0:
+                                progress_bar = create_progress_bar(worker['progress'], length=12)
+                                worker_lines.append(f"{progress_bar}")
+                                
+                                if worker.get('current_bytes') and worker.get('total_bytes'):
+                                    worker_lines.append(
+                                        f"💾 {format_size(worker['current_bytes'])} / {format_size(worker['total_bytes'])}"
+                                    )
+                                
+                                if worker.get('speed'):
+                                    worker_lines.append(f"⚡ {format_size(worker['speed'])}/s")
+                                
+                                if worker.get('eta'):
+                                    worker_lines.append(f"⏱️ {worker['eta']}")
+                            
+                            # Add worker info to status
+                            status_lines.extend(worker_lines)
+                            status_lines.append("")  # Empty line between workers
+                    
+                    # Update message
+                    try:
+                        await status_msg.edit_text("\n".join(status_lines))
+                    except FloodWait as e:
+                        await asyncio.sleep(e.value)
+                    except:
+                        pass
+                    
+                    # Update every 1 second
+                    await asyncio.sleep(1)
+                    
+                except Exception as e:
+                    logger.debug(f"Status updater error: {e}")
+                    await asyncio.sleep(1)
+        
+        # Start 2 concurrent workers
+        worker_tasks = [
+            asyncio.create_task(upload_worker(1)),
+            asyncio.create_task(upload_worker(2))
+        ]
+        
+        # Start status updater
+        updater_task = asyncio.create_task(status_updater())
+        
+        # Wait for workers to complete
+        await asyncio.gather(*worker_tasks, return_exceptions=True)
+        
+        # Wait for queue to be fully processed
+        await file_queue.join()
+        
+        # Stop status updater
+        upload_state['stop_updater'] = True
+        try:
+            await asyncio.wait_for(updater_task, timeout=2.0)
+        except:
+            pass
+        
         # Final status
         elapsed_time = time.time() - start_time
+        successful = upload_state['successful']
+        failed = upload_state['failed']
         
-        status_text = (
-            f"✅ **Upload to Telegram Complete!**\n"
-            f"━━━━━━━━━━━━━━━\n\n"
-            f"✅ Successful: {successful}/{total_files}\n"
-        )
-        
-        if failed > 0:
-            status_text += f"❌ Failed: {failed}\n"
-        
-        status_text += f"⏱️ Time: {format_time(elapsed_time)}\n"
-        
-        if successful > 0 and elapsed_time > 0:
-            avg_time_per_file = elapsed_time / successful
-            status_text += f"⚡ Avg: {format_time(avg_time_per_file)}/file"
+        # Check if task was cancelled
+        if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
+            status_text = (
+                f"🛑 **Upload Cancelled**\n"
+                f"━━━━━━━━━━━━━━━\n\n"
+                f"✅ Sent: {successful}/{total_files}\n"
+                f"❌ Failed: {failed}\n"
+                f"⏱️ Time: {format_time(elapsed_time)}"
+            )
+        else:
+            status_text = (
+                f"✅ **Upload to Telegram Complete!**\n"
+                f"━━━━━━━━━━━━━━━\n\n"
+                f"✅ Successful: {successful}/{total_files}\n"
+            )
+            
+            if failed > 0:
+                status_text += f"❌ Failed: {failed}\n"
+            
+            status_text += f"⏱️ Time: {format_time(elapsed_time)}\n"
+            
+            if successful > 0 and elapsed_time > 0:
+                avg_time_per_file = elapsed_time / successful
+                status_text += f"⚡ Avg: {format_time(avg_time_per_file)}/file"
         
         await status_msg.edit_text(status_text)
     
@@ -1880,262 +1969,375 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
         # Create downloads directory if not exists
         os.makedirs("downloads", exist_ok=True)
         
-        successful_uploads = 0
-        failed_uploads = []
-        total_size_uploaded = 0
-        start_time = time.time()
+        # Shared state for concurrent workers
+        upload_state = {
+            'successful_uploads': 0,
+            'failed_uploads': [],
+            'total_size_uploaded': 0,
+            'completed': 0,
+            'lock': asyncio.Lock(),
+            'active_workers': [],
+            'stop_updater': False
+        }
         
-        # Process each file
-        # Run items with limited concurrency (2 by default)
-        semaphore = TG_TO_DRIVE_SEMAPHORE
-
-        async def _run_one(idx, file_info):
-            async with semaphore:
+        # Create queue for files
+        file_queue = asyncio.Queue()
+        for file_info in file_list:
+            await file_queue.put(file_info)
+        
+        # Worker function
+        async def upload_worker(worker_id):
+            while True:
+                try:
+                    # Get next file from queue
+                    file_info = await asyncio.wait_for(file_queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    # Queue is empty, worker can exit
+                    break
+                
                 # Check for cancellation
                 if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
-                    await status_msg.edit_text(
-                        f"🛑 **Upload Cancelled**\n\n"
-                        f"✅ Uploaded: {successful_uploads}/{len(file_list)}\n"
-                        f"❌ Failed: {len(failed_uploads)}\n"
-                        f"📊 Total: {format_size(total_size_uploaded)}\n"
-                        f"⏱️ Time: {format_time(time.time() - start_time)}"
-                    )
-                    if task_id in ACTIVE_TASKS:
-                        del ACTIVE_TASKS[task_id]
-                    if queue_id and queue_id in UPLOAD_QUEUE:
-                        UPLOAD_QUEUE[queue_id]['status'] = 'cancelled'
-                    return
-
+                    file_queue.task_done()
+                    break
+                
                 filename = file_info['name']
                 msg_id = file_info['msg_id']
                 download_path = None
-
-                # Clean the filename (replace underscores with spaces)
+                
+                # Clean the filename
                 clean_name = clean_filename(filename)
-
-                # Update task progress
-                ACTIVE_TASKS[task_id]['current_file'] = filename
-                ACTIVE_TASKS[task_id]['progress'] = int((idx - 1) / len(file_list) * 100)
-                ACTIVE_TASKS[task_id]['status'] = 'downloading'
-
-                # Auto-retry logic
-                retry_count = 0
-                upload_success = False
-
-                while retry_count < MAX_RETRIES and not upload_success:
-                    try:
-                        # Update status with retry info
-                        retry_text = f" (Retry {retry_count}/{MAX_RETRIES})" if retry_count > 0 else ""
-        
-                        # Create cancel button
-                        cancel_button = InlineKeyboardMarkup([
-                            [InlineKeyboardButton("🛑 Cancel Upload", callback_data=f"cancel_{task_id}")]
-                        ])
-        
-                        await status_msg.edit_text(
-                            f"📥 **Downloading ({idx}/{len(file_list)}){retry_text}**\n"
-                            f"📄 `{filename[:50]}...`\n"
-                            f"✅ {successful_uploads} | ❌ {len(failed_uploads)}\n"
-                            f"📊 Progress: {int((idx-1)/len(file_list)*100)}%",
-                            reply_markup=cancel_button
-                        )
-        
-                        # Download file
-                        download_path = f"downloads/{filename}"
-                        download_start = time.time()
-        
+                
+                # Add to active workers
+                async with upload_state['lock']:
+                    upload_state['active_workers'].append({
+                        'worker_id': worker_id,
+                        'filename': filename,
+                        'stage': 'downloading',
+                        'progress': 0,
+                        'current_bytes': 0,
+                        'total_bytes': 0,
+                        'speed': 0,
+                        'eta': 'Starting...'
+                    })
+                
+                try:
+                    # Auto-retry logic
+                    retry_count = 0
+                    upload_success = False
+                    
+                    while retry_count < MAX_RETRIES and not upload_success:
                         try:
-                            # Get the message object
-                            message = await client.get_messages(status_msg.chat.id, msg_id)
-            
-                            await client.download_media(
-                                message,
-                                file_name=download_path,
-                                progress=progress_callback,
-                                progress_args=(status_msg, download_start, filename, task_id)
-                            )
-                        except FloodWait as e:
-                            logger.warning(f"FloodWait: Sleeping for {e.value} seconds")
-                            await asyncio.sleep(e.value)
-                            # Retry download
-                            message = await client.get_messages(status_msg.chat.id, msg_id)
-                            await client.download_media(
-                                message,
-                                file_name=download_path,
-                                progress=progress_callback,
-                                progress_args=(status_msg, download_start, filename, task_id)
-                            )
-        
-                        # Check for cancellation after download
-                        if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
-                            if download_path and os.path.exists(download_path):
-                                os.remove(download_path)
-                            await status_msg.edit_text(
-                                f"🛑 **Upload Cancelled**\n\n"
-                                f"✅ Uploaded: {successful_uploads}/{len(file_list)}\n"
-                                f"❌ Failed: {len(failed_uploads)}"
-                            )
-                            if task_id in ACTIVE_TASKS:
-                                del ACTIVE_TASKS[task_id]
-                            if queue_id and queue_id in UPLOAD_QUEUE:
-                                UPLOAD_QUEUE[queue_id]['status'] = 'cancelled'
-                            return
-        
-                        if not os.path.exists(download_path):
-                            raise Exception("Download failed - file not found")
-        
-                        file_size = os.path.getsize(download_path)
-        
-                        # Update task status
-                        ACTIVE_TASKS[task_id]['status'] = 'uploading'
-        
-                        # Handle Folder Logic
-                        if flat_upload:
-                            # Not an Audiobook: Upload directly to Root/Parent
-                            upload_folder = parent_folder
-                        else:
-                            # Standard behavior: Create individual folder for the file
-                            # Use cleaned name without extension for folder
-                            folder_name = os.path.splitext(clean_name)[0]
-                            file_folder = get_or_create_folder(service, folder_name, parent_folder)
-            
-                            if not file_folder:
-                                raise Exception("Failed to create file folder")
-            
-                            upload_folder = file_folder
-        
-                        # Upload to Drive with progress
-                        file_metadata = {
-                            'name': clean_name,  # Use cleaned filename
-                            'parents': [upload_folder]
-                        }
-        
-                        # Initial upload message
-                        cancel_button = InlineKeyboardMarkup([
-                            [InlineKeyboardButton("🛑 Cancel Upload", callback_data=f"cancel_{task_id}")]
-                        ])
-        
-                        await status_msg.edit_text(
-                            f"☁️ **Uploading to Drive ({idx}/{len(file_list)}){retry_text}**\n"
-                            f"📄 `{filename[:50]}...`\n"
-                            f"💾 Size: {file_size/1024/1024:.2f} MB\n"
-                            f"✅ {successful_uploads} | ❌ {len(failed_uploads)}\n"
-                            f"📊 Progress: {int((idx-1)/len(file_list)*100)}%\n\n"
-                            f"Starting upload...",
-                            reply_markup=cancel_button
-                        )
-        
-                        # Shared data for progress tracking
-                        progress_data = {
-                            'complete': False, 
-                            'error': None, 
-                            'last_progress': None,
-                            'task_id': task_id,
-                            'cancelled': False
-                        }
-        
-                        # Start upload in executor
-                        loop = asyncio.get_running_loop()
-                        upload_future = loop.run_in_executor(
-                            None,
-                            upload_to_drive_with_progress,
-                            service,
-                            download_path,
-                            file_metadata,
-                            progress_data,
-                            filename
-                        )
-        
-                        # Monitor progress while upload is running
-                        while not progress_data.get('complete') and not progress_data.get('error') and not progress_data.get('cancelled'):
                             # Check for cancellation
                             if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
-                                progress_data['cancelled'] = True
-                                break
-            
-                            if progress_data.get('last_progress'):
-                                p = progress_data['last_progress']
+                                file_queue.task_done()
+                                return
+                            
+                            # Download file from Telegram
+                            download_path = f"downloads/{filename}"
+                            download_start = time.time()
+                            last_download_update = 0
+                            
+                            # Progress callback for Telegram download
+                            async def download_progress_callback(current, total):
+                                nonlocal last_download_update
+                                current_time = time.time()
+                                
+                                # Update every 1.5 seconds
+                                if current_time - last_download_update >= 1.5:
+                                    last_download_update = current_time
+                                    
+                                    progress_pct = int((current / total) * 100) if total > 0 else 0
+                                    elapsed = current_time - download_start
+                                    speed = current / elapsed if elapsed > 0 else 0
+                                    remaining = total - current
+                                    eta = remaining / speed if speed > 0 else 0
+                                    eta_str = format_time(int(eta))
+                                    
+                                    # Update worker state
+                                    async with upload_state['lock']:
+                                        for worker in upload_state['active_workers']:
+                                            if worker['worker_id'] == worker_id:
+                                                worker['progress'] = progress_pct
+                                                worker['current_bytes'] = current
+                                                worker['total_bytes'] = total
+                                                worker['speed'] = int(speed)
+                                                worker['eta'] = eta_str
+                                                break
+                            
+                            try:
+                                message = await client.get_messages(status_msg.chat.id, msg_id)
+                                await client.download_media(
+                                    message,
+                                    file_name=download_path,
+                                    progress=download_progress_callback
+                                )
+                            except FloodWait as e:
+                                logger.warning(f"Worker {worker_id}: FloodWait {e.value}s")
+                                await asyncio.sleep(e.value)
+                                message = await client.get_messages(status_msg.chat.id, msg_id)
+                                await client.download_media(
+                                    message,
+                                    file_name=download_path,
+                                    progress=download_progress_callback
+                                )
+                            
+                            # Check for cancellation after download
+                            if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
+                                if download_path and os.path.exists(download_path):
+                                    os.remove(download_path)
+                                file_queue.task_done()
+                                return
+                            
+                            if not os.path.exists(download_path):
+                                raise Exception("Download failed - file not found")
+                            
+                            file_size = os.path.getsize(download_path)
+                            
+                            # Handle folder logic
+                            if flat_upload:
+                                upload_folder = parent_folder
+                            else:
+                                folder_name = os.path.splitext(clean_name)[0]
+                                file_folder = get_or_create_folder(service, folder_name, parent_folder)
+                                
+                                if not file_folder:
+                                    raise Exception("Failed to create file folder")
+                                
+                                upload_folder = file_folder
+                            
+                            # Upload to Drive
+                            file_metadata = {
+                                'name': clean_name,
+                                'parents': [upload_folder]
+                            }
+                            
+                            # Shared data for progress tracking
+                            progress_data = {
+                                'complete': False,
+                                'error': None,
+                                'last_progress': None,
+                                'task_id': task_id,
+                                'cancelled': False
+                            }
+                            
+                            # Start upload in executor
+                            loop = asyncio.get_running_loop()
+                            upload_future = loop.run_in_executor(
+                                None,
+                                upload_to_drive_with_progress,
+                                service,
+                                download_path,
+                                file_metadata,
+                                progress_data,
+                                filename
+                            )
+                            
+                            # Update worker stage to uploading
+                            async with upload_state['lock']:
+                                for worker in upload_state['active_workers']:
+                                    if worker['worker_id'] == worker_id:
+                                        worker['stage'] = 'uploading'
+                                        worker['progress'] = 0
+                                        worker['current_bytes'] = 0
+                                        worker['total_bytes'] = file_size
+                                        worker['speed'] = 0
+                                        worker['eta'] = 'Starting...'
+                                        break
+                            
+                            # Monitor progress and update worker state
+                            last_progress_update = time.time()
+                            while not progress_data.get('complete') and not progress_data.get('error') and not progress_data.get('cancelled'):
+                                if ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
+                                    progress_data['cancelled'] = True
+                                    break
+                                
+                                # Update worker state from progress_data
+                                current_time = time.time()
+                                if current_time - last_progress_update >= 1:
+                                    last_progress_update = current_time
+                                    last_prog = progress_data.get('last_progress')
+                                    
+                                    if last_prog:
+                                        async with upload_state['lock']:
+                                            for worker in upload_state['active_workers']:
+                                                if worker['worker_id'] == worker_id:
+                                                    worker['progress'] = last_prog.get('progress', 0)
+                                                    worker['current_bytes'] = last_prog.get('current', 0)
+                                                    worker['total_bytes'] = last_prog.get('total', file_size)
+                                                    worker['speed'] = int(last_prog.get('speed', 0))
+                                                    worker['eta'] = last_prog.get('eta', 'Calculating...')
+                                                    break
+                                
+                                await asyncio.sleep(0.5)
+                            
+                            # Check if cancelled
+                            if progress_data.get('cancelled') or ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
+                                if download_path and os.path.exists(download_path):
+                                    os.remove(download_path)
+                                file_queue.task_done()
+                                return
+                            
+                            # Wait for upload to complete
+                            upload_result = await upload_future
+                            
+                            if progress_data.get('error'):
+                                raise Exception(progress_data['error'])
+                            
+                            if upload_result is None:
+                                raise Exception("Upload was cancelled")
+                            
+                            # Update stats
+                            uploaded_size = int(upload_result.get('size', file_size))
+                            
+                            async with upload_state['lock']:
+                                upload_state['successful_uploads'] += 1
+                                upload_state['total_size_uploaded'] += uploaded_size
+                                upload_state['completed'] += 1
+                                
+                                # Update global stats
+                                global TOTAL_FILES, TOTAL_BYTES
+                                TOTAL_FILES += 1
+                                TOTAL_BYTES += uploaded_size
+                            
+                            # Clean up downloaded file
+                            if os.path.exists(download_path):
+                                os.remove(download_path)
+                            
+                            upload_success = True
+                            logger.info(f"✅ Worker {worker_id}: {filename} ({uploaded_size/1024/1024:.2f} MB)")
+                        
+                        except Exception as e:
+                            retry_count += 1
+                            logger.error(f"❌ Worker {worker_id}: {filename} (attempt {retry_count}/{MAX_RETRIES}): {e}")
+                            
+                            if retry_count < MAX_RETRIES:
+                                wait_time = RETRY_DELAY * (2 ** (retry_count - 1))
+                                logger.info(f"Worker {worker_id} retrying in {wait_time}s...")
+                                await asyncio.sleep(wait_time)
+                            else:
+                                async with upload_state['lock']:
+                                    upload_state['failed_uploads'].append(f"{filename}: {str(e)[:50]}")
+                                    upload_state['completed'] += 1
+                                record_failed_upload(task_id, filename, e)
+                            
+                            # Clean up on error
+                            if download_path and os.path.exists(download_path):
                                 try:
-                                    await status_msg.edit_text(
-                                        f"☁️ **Uploading to Drive**{retry_text}\n"
-                                        f"━━━━━━━━━━━━━━━\n"
-                                        f"📄 `{p['filename'][:40]}...`\n\n"
-                                        f"[{p['bar']}] {p['progress']}%\n"
-                                        f"⚡ Speed: {p['speed']/1024/1024:.2f} MB/s\n"
-                                        f"💾 {p['current']/1024/1024:.1f} MB / {p['total']/1024/1024:.1f} MB\n"
-                                        f"⏱️ ETA: {p['eta']}\n\n"
-                                        f"━━━━━━━━━━━━━━━\n"
-                                        f"📊 File: {idx}/{len(file_list)} | Overall: {int((idx-1)/len(file_list)*100)}%\n"
-                                        f"✅ Success: {successful_uploads} | ❌ Failed: {len(failed_uploads)}"
-                                    )
+                                    os.remove(download_path)
                                 except:
                                     pass
-            
-                            # Check every second
-                            await asyncio.sleep(1)
+                
+                except Exception as e:
+                    # Catch any unexpected errors in the worker
+                    logger.error(f"Worker {worker_id} unexpected error: {e}")
+                    async with upload_state['lock']:
+                        upload_state['failed_uploads'].append(f"{filename}: {str(e)[:50]}")
+                        upload_state['completed'] += 1
+                
+                finally:
+                    # Remove from active workers
+                    async with upload_state['lock']:
+                        upload_state['active_workers'] = [
+                            w for w in upload_state['active_workers']
+                            if w['worker_id'] != worker_id
+                        ]
+                    file_queue.task_done()
         
-                        # Check if cancelled during upload
-                        if progress_data.get('cancelled') or ACTIVE_TASKS.get(task_id, {}).get('cancelled', False):
-                            if download_path and os.path.exists(download_path):
-                                os.remove(download_path)
-                            await status_msg.edit_text(
-                                f"🛑 **Upload Cancelled**\n\n"
-                                f"✅ Uploaded: {successful_uploads}/{len(file_list)}\n"
-                                f"❌ Failed: {len(failed_uploads)}"
-                            )
-                            if task_id in ACTIVE_TASKS:
-                                del ACTIVE_TASKS[task_id]
-                            if queue_id and queue_id in UPLOAD_QUEUE:
-                                UPLOAD_QUEUE[queue_id]['status'] = 'cancelled'
-                            return
+        # Status updater task - updates message with all active workers
+        async def status_updater():
+            while not upload_state['stop_updater']:
+                try:
+                    async with upload_state['lock']:
+                        completed = upload_state['completed']
+                        successful = upload_state['successful_uploads']
+                        failed = len(upload_state['failed_uploads'])
+                        workers = list(upload_state['active_workers'])
+                    
+                    # Build status message with all workers
+                    status_lines = [
+                        f"📤 **Uploading to Google Drive**",
+                        f"━━━━━━━━━━━━━━━",
+                        f"📊 Overall: {completed}/{len(file_list)}",
+                        f"✅ Success: {successful} | ❌ Failed: {failed}",
+                        ""
+                    ]
+                    
+                    if workers:
+                        status_lines.append("🔄 **Active Workers:**")
+                        status_lines.append("")
+                        
+                        for worker in workers:
+                            worker_lines = []
+                            stage_icon = "📥" if worker['stage'] == 'downloading' else "☁️"
+                            
+                            # Worker header
+                            worker_lines.append(f"{stage_icon} **Worker {worker['worker_id']}:**")
+                            
+                            # Filename
+                            worker_lines.append(f"📄 `{worker['filename'][:35]}...`")
+                            
+                            # Progress info if available
+                            if worker.get('progress') is not None and worker['progress'] > 0:
+                                progress_bar = create_progress_bar(worker['progress'], length=12)
+                                worker_lines.append(f"{progress_bar}")
+                                
+                                if worker.get('current_bytes') and worker.get('total_bytes'):
+                                    worker_lines.append(
+                                        f"💾 {format_size(worker['current_bytes'])} / {format_size(worker['total_bytes'])}"
+                                    )
+                                
+                                if worker.get('speed'):
+                                    worker_lines.append(f"⚡ {format_size(worker['speed'])}/s")
+                                
+                                if worker.get('eta'):
+                                    worker_lines.append(f"⏱️ {worker['eta']}")
+                            
+                            # Add worker info to status
+                            status_lines.extend(worker_lines)
+                            status_lines.append("")  # Empty line between workers
+                    
+                    # Update message
+                    try:
+                        await status_msg.edit_text("\n".join(status_lines))
+                    except FloodWait as e:
+                        await asyncio.sleep(e.value)
+                    except:
+                        pass
+                    
+                    # Update every 1 second
+                    await asyncio.sleep(1)
+                    
+                except Exception as e:
+                    logger.debug(f"Status updater error: {e}")
+                    await asyncio.sleep(1)
         
-                        # Wait for upload to complete
-                        upload_result = await upload_future
+        # Start 2 concurrent workers
+        worker_tasks = [
+            asyncio.create_task(upload_worker(1)),
+            asyncio.create_task(upload_worker(2))
+        ]
         
-                        if progress_data.get('error'):
-                            raise Exception(progress_data['error'])
+        # Start status updater
+        updater_task = asyncio.create_task(status_updater())
         
-                        if upload_result is None:
-                            raise Exception("Upload was cancelled")
+        # Wait for workers to complete
+        await asyncio.gather(*worker_tasks, return_exceptions=True)
         
-                        # Update stats
-                        uploaded_size = int(upload_result.get('size', file_size))
-                        TOTAL_FILES += 1
-                        TOTAL_BYTES += uploaded_size
-                        total_size_uploaded += uploaded_size
+        # Wait for queue to be fully processed
+        await file_queue.join()
         
-                        # Clean up downloaded file
-                        if os.path.exists(download_path):
-                            os.remove(download_path)
+        # Stop status updater
+        upload_state['stop_updater'] = True
+        try:
+            await asyncio.wait_for(updater_task, timeout=2.0)
+        except:
+            pass
         
-                        successful_uploads += 1
-                        upload_success = True
-                        logger.info(f"✅ Uploaded: {filename} ({uploaded_size/1024/1024:.2f} MB)")
-    
-                    except Exception as e:
-                        retry_count += 1
-                        logger.error(f"❌ Error uploading {filename} (attempt {retry_count}/{MAX_RETRIES}): {e}")
+        # Get final counts
+        successful_uploads = upload_state['successful_uploads']
+        failed_uploads = upload_state['failed_uploads']
+        total_size_uploaded = upload_state['total_size_uploaded']
         
-                        if retry_count < MAX_RETRIES:
-                            # Wait before retry with exponential backoff
-                            wait_time = RETRY_DELAY * (2 ** (retry_count - 1))
-                            logger.info(f"Retrying in {wait_time} seconds...")
-                            await asyncio.sleep(wait_time)
-                        else:
-                            # Max retries reached
-                            failed_uploads.append(f"{filename}: {str(e)[:50]}")
-                            record_failed_upload(task_id, filename, e)
-        
-                        # Clean up on error
-                        if download_path and os.path.exists(download_path):
-                            try:
-                                os.remove(download_path)
-                            except:
-                                pass
-        
-
-        tasks = [asyncio.create_task(_run_one(idx, file_info)) for idx, file_info in enumerate(file_list, 1)]
-        await asyncio.gather(*tasks)
         # Update task progress
         ACTIVE_TASKS[task_id]['progress'] = 100
         ACTIVE_TASKS[task_id]['status'] = 'completed'
@@ -2347,13 +2549,23 @@ async def status_command(client, message):
     uptime = str(datetime.timedelta(seconds=int(time.time() - START_TIME)))
     status_text += (
         f"\n━━━━━━━━━━━━━━━\n"
-        f"⏱️ Uptime: {uptime}\n"
-        f"📈 Total: {TOTAL_FILES:,} files ({TOTAL_BYTES/1024/1024/1024:.2f} GB)"
+        f"⏱️ **Uptime:** {uptime}\n"
+        f"📈 **Total Uploaded:** {TOTAL_FILES:,} files ({TOTAL_BYTES/1024/1024/1024:.2f} GB)\n"
+        f"💾 **Browser Sessions:** {len(BROWSER_SESSIONS)} active"
     )
-    status_text += f"\n⏱️ **Uptime:** {uptime}\n"
-    status_text += f"📈 **Total Uploaded:** {TOTAL_FILES} files ({TOTAL_BYTES/1024/1024/1024:.2f} GB)"
     
-    await message.reply_text(status_text)
+    # NEW: Add cancel buttons for each active task
+    if ACTIVE_TASKS:
+        keyboard = []
+        for task_id in list(ACTIVE_TASKS.keys())[:5]:  # Max 5 buttons
+            keyboard.append([InlineKeyboardButton(
+                f"🛑 Cancel {task_id[:15]}...", 
+                callback_data=f"cancel_{task_id}"
+            )])
+        
+        await message.reply_text(status_text, reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await message.reply_text(status_text)
 
 @app.on_message(filters.command("retry") & filters.user(OWNER_ID))
 async def retry_command(client, message):
@@ -2607,10 +2819,17 @@ async def handle_callback(client, query):
                     await query.answer("❌ Folder not found", show_alert=True)
                     return
                 
+                # FIXED: Save current page before navigating
+                current_page = session.get('page', 0)
+                
                 # Update session
                 session['current_folder'] = folder_id
-                session['path'].append({'name': folder_info['name'], 'id': folder_id})
-                session['page'] = 0
+                session['path'].append({
+                    'name': folder_info['name'], 
+                    'id': folder_id,
+                    'parent_page': current_page  # SAVE PAGE NUMBER
+                })
+                session['page'] = 0  # Reset to page 0 in new folder
                 session['selected_files'] = []
                 
                 # List files in folder
@@ -2836,12 +3055,66 @@ async def handle_callback(client, query):
                 )
                 await query.answer("✅ Selection cleared", show_alert=False)
             
+            # NEW: Select all files on current page
+            elif query.data == "browser_select_page":
+                folders, files, _ = list_drive_files(service, session['current_folder'])
+                page = session.get('page', 0)
+                start_idx = page * ITEMS_PER_PAGE
+                end_idx = start_idx + ITEMS_PER_PAGE
+                
+                all_items = folders + files
+                page_items = all_items[start_idx:end_idx]
+                
+                # Add all items on page to selection
+                for item in page_items:
+                    if item['id'] not in session['selected_files']:
+                        session['selected_files'].append(item['id'])
+                
+                total_items = len(folders) + len(files)
+                keyboard = build_browser_keyboard(user_id, folders, files, total_items)
+                breadcrumb = get_breadcrumb(session)
+                
+                await query.message.edit_text(
+                    f"📁 **File Browser**\n"
+                    f"📍 {breadcrumb}\n"
+                    f"📊 {len(folders)} folders, {len(files)} files",
+                    reply_markup=keyboard
+                )
+                await query.answer(f"✅ Selected {len(page_items)} items", show_alert=False)
+            
+            # NEW: Select all files (only files, not folders) in current folder
+            elif query.data == "browser_select_all_files":
+                folders, files, _ = list_drive_files(service, session['current_folder'])
+                
+                # Add all files (not folders) to selection
+                for file in files:
+                    if file['id'] not in session['selected_files']:
+                        session['selected_files'].append(file['id'])
+                
+                total_items = len(folders) + len(files)
+                keyboard = build_browser_keyboard(user_id, folders, files, total_items)
+                breadcrumb = get_breadcrumb(session)
+                
+                await query.message.edit_text(
+                    f"📁 **File Browser**\n"
+                    f"📍 {breadcrumb}\n"
+                    f"📊 {len(folders)} folders, {len(files)} files",
+                    reply_markup=keyboard
+                )
+                await query.answer(f"✅ Selected {len(files)} files", show_alert=False)
+            
             # Back button
             elif query.data == "browser_back":
                 if len(session['path']) > 1:
-                    session['path'].pop()
+                    # Pop current folder
+                    popped = session['path'].pop()
+                    
+                    # Go to parent folder
                     session['current_folder'] = session['path'][-1]['id']
-                    session['page'] = 0
+                    
+                    # FIXED: Restore the page we were on before entering this folder
+                    session['page'] = popped.get('parent_page', 0)
+                    
                     session['selected_files'] = []
                     
                     # List files
@@ -3132,9 +3405,16 @@ async def handle_callback(client, query):
                     supportsAllDrives=True
                 ).execute()
                 
-                session['path'].append({'id': session['current_folder'], 'name': folder_info['name']})
+                # FIXED: Save current page before navigating
+                current_page = session.get('page', 0)
+                
+                session['path'].append({
+                    'id': session['current_folder'], 
+                    'name': folder_info['name'],
+                    'parent_page': current_page  # SAVE PAGE
+                })
                 session['current_folder'] = folder_id
-                session['page'] = 0
+                session['page'] = 0  # Reset to page 0 in new folder
             except Exception as e:
                 await query.answer(f"❌ Error: {str(e)}", show_alert=True)
                 return
@@ -3234,10 +3514,15 @@ async def handle_callback(client, query):
             session = BROWSER_SESSIONS[user_id]
             
             if session['path'] and len(session['path']) > 1:
-                session['path'].pop()
+                # Pop current folder
+                popped = session['path'].pop()
+                
+                # Get parent folder
                 prev_folder = session['path'][-1]
                 session['current_folder'] = prev_folder['id']
-                session['page'] = 0
+                
+                # FIXED: Restore the page we were on
+                session['page'] = popped.get('parent_page', 0)
                 
                 service = get_drive_service()
                 if not service:
