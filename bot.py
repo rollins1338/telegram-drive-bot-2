@@ -3404,6 +3404,12 @@ async def handle_callback(client, query):
                 await query.answer("❌ Failed to connect to Drive", show_alert=True)
                 return
             
+            # FIXED: Initialize browser session properly
+            session = get_browser_session(user_id)
+            session['current_folder'] = DRIVE_FOLDER_ID
+            session['path'] = [{'name': 'My Drive', 'id': DRIVE_FOLDER_ID}]
+            session['page'] = 0
+            
             folders, _, _ = list_drive_files(service, DRIVE_FOLDER_ID)
             keyboard = build_folder_selection_keyboard(user_id, folders, DRIVE_FOLDER_ID)
             
@@ -4364,6 +4370,13 @@ async def handle_text(client, message: Message):
             if key in TEMP_FILES:
                 del TEMP_FILES[key]
             return
+        
+        # FIXED: Initialize browser session properly BEFORE building keyboard
+        session = get_browser_session(user_id)
+        # Reset to root folder
+        session['current_folder'] = DRIVE_FOLDER_ID
+        session['path'] = [{'name': 'My Drive', 'id': DRIVE_FOLDER_ID}]
+        session['page'] = 0
         
         folders, _, _ = list_drive_files(service, DRIVE_FOLDER_ID)
         keyboard = build_folder_selection_keyboard(user_id, folders, DRIVE_FOLDER_ID)
