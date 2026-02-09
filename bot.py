@@ -3385,7 +3385,27 @@ async def handle_callback(client, query):
             file_list = pending['file_list']
             series_name = pending.get('series_name')
             flat_upload = pending.get('flat_upload', False)
+            mode = pending.get('mode')
             key = pending.get('key')
+            
+            # Special handling for series_subfolder mode
+            if mode == 'series_subfolder':
+                # Get the selected folder's name to use as series name
+                service = get_drive_service()
+                if service:
+                    try:
+                        folder_info = service.files().get(
+                            fileId=selected_folder_id,
+                            fields="name"
+                        ).execute()
+                        series_name = folder_info.get('name', 'Unknown Series')
+                    except Exception as e:
+                        logger.error(f"Failed to get folder name: {e}")
+                        series_name = "Unknown Series"
+                
+                # In this mode, we want to create a subfolder INSIDE the selected folder
+                # So we pass selected_folder_id as parent and series_name will create subfolder
+                flat_upload = False  # Ensure subfolder creation
             
             # Clean up
             del PENDING_FOLDER_SELECTION[user_id]
@@ -3395,7 +3415,28 @@ async def handle_callback(client, query):
             # Start upload with selected folder as parent
             queue_id = add_to_queue(file_list, series_name=series_name, flat_upload=flat_upload)
             
-            if series_name:
+            if mode == 'series_subfolder':
+                # Get folder name for better message
+                service = get_drive_service()
+                folder_name = "Selected Folder"
+                if service:
+                    try:
+                        folder_info = service.files().get(
+                            fileId=selected_folder_id,
+                            fields="name"
+                        ).execute()
+                        folder_name = folder_info.get('name', 'Selected Folder')
+                    except:
+                        pass
+                
+                await query.message.edit_text(
+                    f"🚀 **Starting Upload**\n\n"
+                    f"📁 Series: **{folder_name}**\n"
+                    f"📂 Subfolder will be created for this file\n"
+                    f"📊 Files: {len(file_list)}\n"
+                    f"📋 Queue ID: `{queue_id}`"
+                )
+            elif series_name:
                 await query.message.edit_text(
                     f"🚀 **Starting Upload**\n\n"
                     f"Series: **{series_name}**\n"
@@ -3915,6 +3956,24 @@ async def handle_callback(client, query):
             await query.answer()
         
         elif mode == "custom":
+            # Show options: Enter new name OR select existing folder
+            buttons = [
+                [InlineKeyboardButton("✏️ Enter New Series Name", callback_data=f"custom_new|{key}")],
+                [InlineKeyboardButton("📁 Select Existing Series Folder", callback_data=f"custom_select|{key}")],
+                [InlineKeyboardButton("🔙 Back", callback_data=f"back_to_options|{key}")]
+            ]
+            
+            await query.message.edit_text(
+                "📚 **Series Upload Options**\n\n"
+                "Choose how to upload this file:\n\n"
+                "✏️ **Enter New Series Name:** Create a new series folder\n"
+                "📁 **Select Existing Series:** Add to existing series folder\n\n"
+                "💡 Tip: The file will be uploaded to a subfolder inside the series folder",
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+            await query.answer()
+        
+        elif mode == "custom_new":
             # Ask for custom series name (folder selection will show after)
             ACTIVE_SERIES[query.from_user.id] = {
                 'file_list': file_list,
@@ -3922,10 +3981,73 @@ async def handle_callback(client, query):
                 'needs_folder_selection': True  # Flag to show folder selector after name entry
             }
             await query.message.edit_text(
-                "✏️ **Enter Series Name**\n\n"
+                "✏️ **Enter New Series Name**\n\n"
                 "Type the series name and send it as a message.\n\n"
                 "📝 Example: *Possessing Violet*\n\n"
             )
+            await query.answer()
+        
+        elif mode == "custom_select":
+            # Show folder browser to select existing series folder
+            user_id = query.from_user.id
+            file_count = len(file_list)
+            
+            PENDING_FOLDER_SELECTION[user_id] = {
+                'file_list': file_list,
+                'series_name': None,  # Will be set to selected folder name
+                'mode': 'series_subfolder',  # Special mode: create subfolder inside selected folder
+                'flat_upload': False,
+                'key': key
+            }
+            
+            # Initialize browser session
+            if user_id not in BROWSER_SESSIONS:
+                BROWSER_SESSIONS[user_id] = {
+                    'current_folder': DRIVE_FOLDER_ID,
+                    'path': [{'name': 'Root', 'id': DRIVE_FOLDER_ID}],
+                    'selected_files': [],
+                    'page': 0
+                }
+            
+            session = BROWSER_SESSIONS[user_id]
+            session['current_folder'] = DRIVE_FOLDER_ID
+            session['path'] = [{'name': 'Root', 'id': DRIVE_FOLDER_ID}]
+            session['page'] = 0
+            
+            # Show folder browser
+            service = get_drive_service()
+            if not service:
+                await query.answer("❌ Drive connection failed", show_alert=True)
+                return
+            
+            folders, _, _ = list_drive_files(service, DRIVE_FOLDER_ID)
+            keyboard = build_folder_selection_keyboard(user_id, folders, DRIVE_FOLDER_ID)
+            
+            await query.message.edit_text(
+                f"📁 **Select Series Folder**\n\n"
+                f"🎯 The file will be uploaded to a subfolder inside the selected series folder\n"
+                f"📊 {file_count} file(s)\n\n"
+                f"Choose the series folder:",
+                reply_markup=keyboard
+            )
+            await query.answer()
+        
+        elif mode == "back_to_options":
+            # Go back to single file options
+            buttons = [
+                [InlineKeyboardButton("📂 Part of a Series", callback_data=f"custom|{key}")],
+                [InlineKeyboardButton("📁 Standalone File", callback_data=f"std|{key}")],
+                [InlineKeyboardButton("🚫 Not an Audiobook", callback_data=f"root|{key}")],
+                [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_selection|{key}")]
+            ]
+            
+            txt = f"📄 **File Received**\n`{file_list[0]['name']}`"
+            if file_list[0]['caption']: 
+                txt += f"\n🏷 **Caption:** `{file_list[0]['caption']}`"
+            txt += "\n\n💡 Choose upload mode:"
+            
+            await query.message.edit_text(txt, reply_markup=InlineKeyboardMarkup(buttons))
+            await query.answer()
         
         await query.answer()
     
