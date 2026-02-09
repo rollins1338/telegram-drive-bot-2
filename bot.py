@@ -109,6 +109,10 @@ DOWNLOAD_QUEUE = {}  # Format: {task_id: {'files': [], 'status': str, 'progress'
 # NEW: Folder selection for uploads
 PENDING_FOLDER_SELECTION = {}  # Format: {user_id: {'file_list': [], 'series_name': str, 'mode': str, 'flat_upload': bool}}
 
+# Multi-file detection (for non-album forwarded files)
+PENDING_MULTI_FILES = {}  # Format: {user_id: {'files': [], 'timer_task': Task, 'last_file_time': float}}
+MULTI_FILE_WINDOW = 3  # seconds to wait for more files
+
 # Pagination settings
 ITEMS_PER_PAGE = 8
 
@@ -419,6 +423,25 @@ def format_time(seconds):
         hours = int(seconds/3600)
         mins = int((seconds%3600)/60)
         return f"{hours}h {mins}m"
+
+async def safe_edit_message(message, text, **kwargs):
+    """Safely edit message with timeout and error handling to prevent freezing"""
+    try:
+        await asyncio.wait_for(
+            message.edit_text(text, **kwargs),
+            timeout=5.0
+        )
+        return True
+    except asyncio.TimeoutError:
+        logger.warning("Message edit timed out - continuing")
+        return False
+    except FloodWait as e:
+        logger.warning(f"FloodWait {e.value}s on message edit")
+        await asyncio.sleep(e.value)
+        return False
+    except Exception as e:
+        logger.debug(f"Message edit error: {e}")
+        return False
 
 # ==================== GOOGLE DRIVE DOWNLOAD FUNCTIONS ====================
 def extract_file_id_from_url(url):
@@ -1110,7 +1133,8 @@ async def download_from_drive_task(client, status_msg, file_ids, service):
                 ])
                 
                 # Update status
-                await status_msg.edit_text(
+                await safe_edit_message(
+                    status_msg,
                     f"📥 **Downloading from Drive ({idx}/{total_files})**\n"
                     f"📄 `{filename[:50]}...`\n"
                     f"💾 Size: {format_size(file_size)}\n"
@@ -1180,28 +1204,22 @@ async def download_from_drive_task(client, status_msg, file_ids, service):
                             
                             progress_bar = create_progress_bar(progress, length=12)
                             
-                            try:
-                                await status_msg.edit_text(
-                                    f"📥 **Downloading from Drive ({idx}/{total_files})**\n"
-                                    f"📄 `{filename[:45]}...`\n"
-                                    f"💾 Size: {format_size(file_size)}\n\n"
-                                    f"{progress_bar}\n"
-                                    f"⚡ Speed: {format_size(speed)}/s\n"
-                                    f"⏱️ ETA: {eta_str}\n\n"
-                                    f"✅ {successful} | ❌ {failed}"
-                                )
-                            except FloodWait as e:
-                                logger.warning(f"FloodWait during download: {e.value}s")
-                                await asyncio.sleep(e.value)
-                            except Exception as e:
-                                # Ignore other update errors to avoid breaking download
-                                logger.debug(f"Status update error (non-critical): {e}")
-                                pass
+                            await safe_edit_message(
+                                status_msg,
+                                f"📥 **Downloading from Drive ({idx}/{total_files})**\n"
+                                f"📄 `{filename[:45]}...`\n"
+                                f"💾 Size: {format_size(file_size)}\n\n"
+                                f"{progress_bar}\n"
+                                f"⚡ Speed: {format_size(speed)}/s\n"
+                                f"⏱️ ETA: {eta_str}\n\n"
+                                f"✅ {successful} | ❌ {failed}"
+                            )
                 
                 fh.close()
                 
                 # Send to Telegram
-                await status_msg.edit_text(
+                await safe_edit_message(
+                    status_msg,
                     f"📤 **Sending to Telegram ({idx}/{total_files})**\n"
                     f"📄 `{filename[:50]}...`\n"
                     f"💾 Size: {format_size(file_size)}\n"
@@ -1932,6 +1950,7 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
     upload_parent = parent_folder_id if parent_folder_id else DRIVE_FOLDER_ID
     
     task_id = f"{status_msg.chat.id}_{status_msg.id}"
+    start_time = time.time()  # Track upload start time
     ACTIVE_TASKS[task_id] = {
         'cancelled': False, 
         'files_list': file_list,
@@ -2250,8 +2269,18 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
         
         # Status updater task - updates message with all active workers
         async def status_updater():
+            last_update = 0
+            update_interval = 2  # Update every 2 seconds to avoid FloodWait
+            
             while not upload_state['stop_updater']:
                 try:
+                    current_time = time.time()
+                    
+                    # Only update if enough time has passed
+                    if current_time - last_update < update_interval:
+                        await asyncio.sleep(0.5)
+                        continue
+                    
                     async with upload_state['lock']:
                         completed = upload_state['completed']
                         successful = upload_state['successful_uploads']
@@ -2301,20 +2330,16 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
                             status_lines.extend(worker_lines)
                             status_lines.append("")  # Empty line between workers
                     
-                    # Update message
-                    try:
-                        await status_msg.edit_text("\n".join(status_lines))
-                    except FloodWait as e:
-                        await asyncio.sleep(e.value)
-                    except:
-                        pass
+                    # Update message with timeout protection
+                    await safe_edit_message(status_msg, "\n".join(status_lines))
+                    last_update = current_time
                     
-                    # Update every 1 second
-                    await asyncio.sleep(1)
+                    # Sleep before next update
+                    await asyncio.sleep(0.5)
                     
                 except Exception as e:
-                    logger.debug(f"Status updater error: {e}")
-                    await asyncio.sleep(1)
+                    logger.error(f"Status updater critical error: {e}")
+                    await asyncio.sleep(2)
         
         # Start 2 concurrent workers
         worker_tasks = [
@@ -2706,32 +2731,31 @@ async def search_command(client, message):
 
 @app.on_message(filters.media & filters.user(OWNER_ID))
 async def handle_media(client, message: Message):
-    """Handle incoming media files"""
+    """Handle incoming media files with multi-file detection"""
     try:
+        user_id = message.from_user.id
+        
         # Get file object and name
         media_type = message.media.value
         file_obj = getattr(message, media_type)
         filename = getattr(file_obj, 'file_name', None)
-        caption = message.caption or ""  # Capture caption
+        caption = message.caption or ""
         
         if not filename:
-            # Generate filename for media without names
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             ext_map = {'photo': 'jpg', 'video': 'mp4', 'audio': 'mp3', 'voice': 'ogg', 'animation': 'gif'}
             ext = ext_map.get(media_type, 'file')
             filename = f"{media_type}_{timestamp}.{ext}"
         
-        # Info object
         file_info = {'msg_id': message.id, 'name': filename, 'caption': caption}
 
-        # Check if part of media group (album)
+        # Handle media groups (albums) normally
         if message.media_group_id:
             group_id = message.media_group_id
             
             if group_id not in ALBUMS:
                 ALBUMS[group_id] = []
                 
-                # Wait for all album files (2 second delay)
                 async def process_album():
                     await asyncio.sleep(2)
                     
@@ -2740,29 +2764,14 @@ async def handle_media(client, message: Message):
                         key = f"album_{group_id}"
                         TEMP_FILES[key] = file_list
                         
-                        # Check for ANY caption in the album
-                        detected_caption = next((f['caption'] for f in file_list if f['caption']), None)
-                        first_file = file_list[0]['name']
-                        cleaned_name = clean_series_name(first_file)
+                        # Multiple files = Series, prompt for name
+                        buttons = [
+                            [InlineKeyboardButton("✏️ Enter Series Name", callback_data=f"custom|{key}")],
+                            [InlineKeyboardButton("🚫 Not Audiobooks", callback_data=f"root|{key}")],
+                            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_selection|{key}")]
+                        ]
                         
-                        buttons = []
-                        # 1. Series (Caption OR Auto) - Priority to Caption
-                        if detected_caption:
-                            buttons.append([InlineKeyboardButton(f"📂 Series: {detected_caption[:30]}...", callback_data=f"cap|{key}")])
-                        else:
-                            buttons.append([InlineKeyboardButton(f"📂 Series: {cleaned_name[:30]}...", callback_data=f"auto|{key}")])
-                        
-                        # 2. Standalone
-                        buttons.append([InlineKeyboardButton("📁 Standalone", callback_data=f"std|{key}")])
-                        # 3. Not an Audiobook
-                        buttons.append([InlineKeyboardButton("🚫 Not an Audiobook", callback_data=f"root|{key}")])
-                        # 4. Custom
-                        buttons.append([InlineKeyboardButton("✏️ Custom Series Name", callback_data=f"custom|{key}")])
-                        # 5. Cancel
-                        buttons.append([InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_selection|{key}")])
-
-                        txt = f"📦 **Album Detected**\n📚 Files: {len(file_list)}"
-                        if detected_caption: txt += f"\n🏷 **Caption:** `{detected_caption}`"
+                        txt = f"📦 **Album Detected**\n📚 Files: {len(file_list)}\n\n💡 Enter the series name below:"
                         await message.reply_text(txt, reply_markup=InlineKeyboardMarkup(buttons))
                 
                 asyncio.create_task(process_album())
@@ -2770,30 +2779,69 @@ async def handle_media(client, message: Message):
             ALBUMS[group_id].append(file_info)
         
         else:
-            # Single file
-            key = f"single_{message.id}"
-            TEMP_FILES[key] = [file_info]
-            cleaned_name = clean_series_name(filename)
+            # Non-album file - check for multi-file scenario
+            current_time = time.time()
             
-            buttons = []
-            # 1. Series (Caption OR Auto)
-            if caption:
-                buttons.append([InlineKeyboardButton(f"📂 Series: {caption[:30]}...", callback_data=f"cap|{key}")])
-            else:
-                buttons.append([InlineKeyboardButton(f"📂 Series: {cleaned_name[:30]}...", callback_data=f"auto|{key}")])
+            # Initialize or update multi-file tracker
+            if user_id not in PENDING_MULTI_FILES:
+                PENDING_MULTI_FILES[user_id] = {
+                    'files': [],
+                    'timer_task': None,
+                    'last_file_time': current_time
+                }
             
-            # 2. Standalone
-            buttons.append([InlineKeyboardButton("📁 Standalone", callback_data=f"std|{key}")])
-            # 3. Custom Series Name
-            buttons.append([InlineKeyboardButton("✏️ Custom Series Name", callback_data=f"custom|{key}")])
-            # 4. Not an Audiobook
-            buttons.append([InlineKeyboardButton("🚫 Not an Audiobook", callback_data=f"root|{key}")])
-            # 5. Cancel
-            buttons.append([InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_selection|{key}")])
+            pending = PENDING_MULTI_FILES[user_id]
             
-            txt = f"📄 **File Received**\n`{filename}`"
-            if caption: txt += f"\n🏷 **Caption:** `{caption}`"
-            await message.reply_text(txt, reply_markup=InlineKeyboardMarkup(buttons))
+            # Cancel existing timer if any
+            if pending['timer_task'] and not pending['timer_task'].done():
+                pending['timer_task'].cancel()
+            
+            # Add file to pending list
+            pending['files'].append(file_info)
+            pending['last_file_time'] = current_time
+            
+            # Create timer to process files
+            async def process_multi_files():
+                await asyncio.sleep(MULTI_FILE_WINDOW)
+                
+                if user_id in PENDING_MULTI_FILES:
+                    files = PENDING_MULTI_FILES[user_id]['files']
+                    del PENDING_MULTI_FILES[user_id]
+                    
+                    if len(files) > 1:
+                        # Multiple files = Series
+                        key = f"multi_{user_id}_{int(time.time())}"
+                        TEMP_FILES[key] = files
+                        
+                        buttons = [
+                            [InlineKeyboardButton("✏️ Enter Series Name", callback_data=f"custom|{key}")],
+                            [InlineKeyboardButton("🚫 Not Audiobooks", callback_data=f"root|{key}")],
+                            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_selection|{key}")]
+                        ]
+                        
+                        txt = f"📦 **Multiple Files Detected**\n📚 Files: {len(files)}\n\n💡 Enter the series name below:"
+                        await message.reply_text(txt, reply_markup=InlineKeyboardMarkup(buttons))
+                    
+                    else:
+                        # Single file
+                        key = f"single_{files[0]['msg_id']}"
+                        TEMP_FILES[key] = files
+                        
+                        buttons = [
+                            [InlineKeyboardButton("📂 Part of a Series", callback_data=f"custom|{key}")],
+                            [InlineKeyboardButton("📁 Standalone File", callback_data=f"std|{key}")],
+                            [InlineKeyboardButton("🚫 Not an Audiobook", callback_data=f"root|{key}")],
+                            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_selection|{key}")]
+                        ]
+                        
+                        txt = f"📄 **File Received**\n`{files[0]['name']}`"
+                        if files[0]['caption']: 
+                            txt += f"\n🏷 **Caption:** `{files[0]['caption']}`"
+                        txt += "\n\n💡 Choose upload mode:"
+                        await message.reply_text(txt, reply_markup=InlineKeyboardMarkup(buttons))
+            
+            # Start timer
+            pending['timer_task'] = asyncio.create_task(process_multi_files())
     
     except Exception as e:
         logger.error(f"Error handling media: {e}")
@@ -3388,8 +3436,8 @@ async def handle_callback(client, query):
                 await query.answer("❌ Failed to connect to Drive", show_alert=True)
                 return
             
-            # Update session
-            session = BROWSER_SESSIONS[user_id]
+            # Initialize or get session
+            session = get_browser_session(user_id)
             
             # Get folder info
             try:
@@ -3456,7 +3504,7 @@ async def handle_callback(client, query):
             key = pending.get('key')
             
             # Get breadcrumb for confirmation
-            session = BROWSER_SESSIONS[user_id]
+            session = get_browser_session(user_id)
             breadcrumb = get_breadcrumb(session)
             
             # Clean up
@@ -3683,6 +3731,8 @@ async def handle_callback(client, query):
         if mode == "std":
             # Standalone mode - Show folder selector first
             user_id = query.from_user.id
+            file_count = len(file_list)
+            file_word = "file" if file_count == 1 else "files"
             
             PENDING_FOLDER_SELECTION[user_id] = {
                 'file_list': file_list,
@@ -3718,8 +3768,8 @@ async def handle_callback(client, query):
             await query.message.edit_text(
                 f"📁 **Select Upload Destination**\n\n"
                 f"🎯 Mode: Standalone\n"
-                f"📂 Each file gets its own folder\n"
-                f"📊 {len(file_list)} file(s)\n\n"
+                f"📂 Each {file_word} will be in its own folder\n"
+                f"📊 {file_count} {file_word}\n\n"
                 f"Choose destination folder:",
                 reply_markup=keyboard
             )
@@ -3728,6 +3778,8 @@ async def handle_callback(client, query):
         elif mode == "root":
             # Root mode - Show folder selector
             user_id = query.from_user.id
+            file_count = len(file_list)
+            file_word = "file" if file_count == 1 else "files"
             
             PENDING_FOLDER_SELECTION[user_id] = {
                 'file_list': file_list,
@@ -3762,8 +3814,8 @@ async def handle_callback(client, query):
             
             await query.message.edit_text(
                 f"📁 **Select Upload Destination**\n\n"
-                f"🎯 Mode: Direct Upload (No subfolders)\n"
-                f"📊 {len(file_list)} file(s)\n\n"
+                f"🎯 Mode: Direct Upload (No organization)\n"
+                f"📊 {file_count} {file_word} will be uploaded without folders\n\n"
                 f"Choose destination folder:",
                 reply_markup=keyboard
             )
@@ -3870,9 +3922,10 @@ async def handle_callback(client, query):
                 'needs_folder_selection': True  # Flag to show folder selector after name entry
             }
             await query.message.edit_text(
-                "✏️ **Enter Custom Series Name**\n\n"
-                "Reply with the series name you want to use.\n"
-                "After that, you'll choose where to save it."
+                "✏️ **Enter Series Name**\n\n"
+                "Type the series name and send it as a message.\n\n"
+                "📝 Example: *Harry Potter*\n\n"
+                "After entering the name, you'll choose the upload destination."
             )
         
         await query.answer()
