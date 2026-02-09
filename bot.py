@@ -2001,7 +2001,8 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
             'completed': 0,
             'lock': asyncio.Lock(),
             'active_workers': [],
-            'stop_updater': False
+            'stop_updater': False,
+            'folders_created': set()  # Track actual folder names created
         }
         
         # Create queue for files
@@ -2128,6 +2129,10 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
                                     raise Exception("Failed to create file folder")
                                 
                                 upload_folder = file_folder
+                                
+                                # Track folder name for final message
+                                async with upload_state['lock']:
+                                    upload_state['folders_created'].add(folder_name)
                             
                             # Upload to Drive
                             file_metadata = {
@@ -2381,7 +2386,22 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
         
         # Final status
         elapsed_time = time.time() - start_time
-        location_text = "Root (No Folders)" if flat_upload else (f"**{series_name}**" if series_name else "Root -> Standalone")
+        
+        # Determine location text based on actual folders created
+        if flat_upload:
+            location_text = "Root (No Folders)"
+        elif series_name:
+            location_text = f"**{series_name}**"
+        else:
+            # Show actual folders created for standalone uploads
+            folders_list = sorted(upload_state['folders_created'])
+            if folders_list:
+                if len(folders_list) == 1:
+                    location_text = f"Root -> **{folders_list[0]}**"
+                else:
+                    location_text = f"Root -> Multiple Folders ({len(folders_list)})"
+            else:
+                location_text = "Root"
         
         status_text = (
             f"✅ **Upload Complete!**\n"
