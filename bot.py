@@ -320,6 +320,52 @@ def get_or_create_folder(service, folder_name, parent_id, retry_count=0, max_ret
         logger.error(f"Critical error in get_or_create_folder for '{folder_name}': {e}")
         return None
 
+def get_folder_path(service, folder_id):
+    """
+    Build complete folder path from folder ID to root
+    Returns path string like "Root -> Romance -> Series -> Book 1"
+    """
+    try:
+        if folder_id == DRIVE_FOLDER_ID:
+            return "Root"
+        
+        path_parts = []
+        current_id = folder_id
+        max_depth = 10  # Prevent infinite loops
+        depth = 0
+        
+        while current_id and current_id != DRIVE_FOLDER_ID and depth < max_depth:
+            try:
+                folder = service.files().get(
+                    fileId=current_id,
+                    fields="id,name,parents"
+                ).execute()
+                
+                path_parts.insert(0, folder.get('name', 'Unknown'))
+                
+                # Get parent folder ID
+                parents = folder.get('parents', [])
+                if parents:
+                    current_id = parents[0]
+                else:
+                    break
+                    
+                depth += 1
+                
+            except Exception as e:
+                logger.error(f"Error getting folder info for {current_id}: {e}")
+                break
+        
+        # Build path string
+        if path_parts:
+            return "Root -> " + " -> ".join(path_parts)
+        else:
+            return "Root"
+            
+    except Exception as e:
+        logger.error(f"Error building folder path: {e}")
+        return "Root"
+
 def clean_series_name(filename):
     """
     IMPROVED: Extract clean series name from filename
@@ -2001,7 +2047,8 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
             'completed': 0,
             'lock': asyncio.Lock(),
             'active_workers': [],
-            'stop_updater': False
+            'stop_updater': False,
+            'upload_folders': set()  # Track all folder IDs where files are saved
         }
         
         # Create queue for files
@@ -2218,6 +2265,9 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
                                 upload_state['total_size_uploaded'] += uploaded_size
                                 upload_state['completed'] += 1
                                 
+                                # Track where this file was uploaded
+                                upload_state['upload_folders'].add(upload_folder)
+                                
                                 # Update global stats
                                 global TOTAL_FILES, TOTAL_BYTES
                                 TOTAL_FILES += 1
@@ -2381,7 +2431,30 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
         
         # Final status
         elapsed_time = time.time() - start_time
-        location_text = "Root (No Folders)" if flat_upload else (f"**{series_name}**" if series_name else "Root -> Standalone")
+        
+        # Determine location text based on actual upload folders
+        upload_folders = upload_state['upload_folders']
+        
+        if len(upload_folders) == 0:
+            location_text = "Root"
+        elif len(upload_folders) == 1:
+            # Single folder - show complete path
+            folder_id = list(upload_folders)[0]
+            location_text = get_folder_path(service, folder_id)
+        else:
+            # Multiple folders - show all paths
+            paths = []
+            for folder_id in sorted(upload_folders):
+                path = get_folder_path(service, folder_id)
+                paths.append(path)
+            
+            # If 2-3 folders, show all paths
+            if len(paths) <= 3:
+                location_text = "\n     ".join(paths)  # Indent continuation lines
+            else:
+                # Too many folders, show summary
+                common_parent = paths[0].rsplit(' -> ', 1)[0] if ' -> ' in paths[0] else "Root"
+                location_text = f"{common_parent} -> Multiple Folders ({len(upload_folders)})"
         
         status_text = (
             f"✅ **Upload Complete!**\n"
@@ -2433,7 +2506,7 @@ async def start_unauthorized(client, message):
     snarky_messages = [
         "🚫 Nice try, but this bot is **RxxFii's personal butler**.\n\nYou? You're not on the list. 💅",
         "🙄 Oh look, another stranger trying to use my services.\n\n**Access Denied.** Get your own bot.",
-        "🤖 *Beep boop* Error 403: **You're not RxxFii**\n\nThis bot doesn't work for peasants. 👑",
+        "⚡ *Beep boop* Error 403: **You're not RxxFii**\n\nThis bot doesn't work for peasants. 👑",
         "😂 Did you really think this would work?\n\nThis is a **VIP-only bot**. Spoiler: You're not VIP.",
         "🔒 **UNAUTHORIZED ACCESS DETECTED**\n\nThis bot serves one master: RxxFii.\n\nYou ain't it, chief.",
         "🎭 Roses are red, violets are blue,\nThis bot's for RxxFii, not for you. 💐",
@@ -2449,7 +2522,7 @@ async def start_command(client, message):
     uptime = format_time(time.time() - START_TIME)
     
     await message.reply_text(
-        "🤖 **RxUploader Bot**\n"
+        "⚡ **RxUploader Bot**\n"
         "━━━━━━━━━━━━━━━\n\n"
         "**📤 Upload to Drive**\n"
         "Send files → Auto-upload to Google Drive\n"
@@ -2689,7 +2762,7 @@ async def search_command(client, message):
         query = message.text.split(maxsplit=1)[1] if len(message.text.split()) > 1 else None
         
         if not query:
-            await message.reply_text("🔍 **Search Drive**\n\nUsage: `/search <query>`\n\nExample: `/search Harry Potter`")
+            await message.reply_text("🔍 **Search Drive**\n\nUsage: `/search <query>`\n\nExample: `/search Possessing Violet`")
             return
         
         service = get_drive_service()
@@ -2724,7 +2797,7 @@ async def search_command(client, message):
         )
     
     except IndexError:
-        await message.reply_text("🔍 **Search Drive**\n\nUsage: `/search <query>`\n\nExample: `/search Harry Potter`")
+        await message.reply_text("🔍 **Search Drive**\n\nUsage: `/search <query>`\n\nExample: `/search Possessing Violet`")
     except Exception as e:
         logger.error(f"Search error: {e}")
         await message.reply_text(f"❌ Error: {str(e)}")
@@ -3385,7 +3458,27 @@ async def handle_callback(client, query):
             file_list = pending['file_list']
             series_name = pending.get('series_name')
             flat_upload = pending.get('flat_upload', False)
+            mode = pending.get('mode')
             key = pending.get('key')
+            
+            # Special handling for series_subfolder mode
+            if mode == 'series_subfolder':
+                # Get the selected folder's name to use as series name
+                service = get_drive_service()
+                if service:
+                    try:
+                        folder_info = service.files().get(
+                            fileId=selected_folder_id,
+                            fields="name"
+                        ).execute()
+                        series_name = folder_info.get('name', 'Unknown Series')
+                    except Exception as e:
+                        logger.error(f"Failed to get folder name: {e}")
+                        series_name = "Unknown Series"
+                
+                # In this mode, we want to create a subfolder INSIDE the selected folder
+                # So we pass selected_folder_id as parent and series_name will create subfolder
+                flat_upload = False  # Ensure subfolder creation
             
             # Clean up
             del PENDING_FOLDER_SELECTION[user_id]
@@ -3395,7 +3488,28 @@ async def handle_callback(client, query):
             # Start upload with selected folder as parent
             queue_id = add_to_queue(file_list, series_name=series_name, flat_upload=flat_upload)
             
-            if series_name:
+            if mode == 'series_subfolder':
+                # Get folder name for better message
+                service = get_drive_service()
+                folder_name = "Selected Folder"
+                if service:
+                    try:
+                        folder_info = service.files().get(
+                            fileId=selected_folder_id,
+                            fields="name"
+                        ).execute()
+                        folder_name = folder_info.get('name', 'Selected Folder')
+                    except:
+                        pass
+                
+                await query.message.edit_text(
+                    f"🚀 **Starting Upload**\n\n"
+                    f"📁 Series: **{folder_name}**\n"
+                    f"📂 Subfolder will be created for this file\n"
+                    f"📊 Files: {len(file_list)}\n"
+                    f"📋 Queue ID: `{queue_id}`"
+                )
+            elif series_name:
                 await query.message.edit_text(
                     f"🚀 **Starting Upload**\n\n"
                     f"Series: **{series_name}**\n"
@@ -3915,6 +4029,24 @@ async def handle_callback(client, query):
             await query.answer()
         
         elif mode == "custom":
+            # Show options: Enter new name OR select existing folder
+            buttons = [
+                [InlineKeyboardButton("✏️ Enter New Series Name", callback_data=f"custom_new|{key}")],
+                [InlineKeyboardButton("📁 Select Existing Series Folder", callback_data=f"custom_select|{key}")],
+                [InlineKeyboardButton("🔙 Back", callback_data=f"back_to_options|{key}")]
+            ]
+            
+            await query.message.edit_text(
+                "📚 **Series Upload Options**\n\n"
+                "Choose how to upload this file:\n\n"
+                "✏️ **Enter New Series Name:** Create a new series folder\n"
+                "📁 **Select Existing Series:** Add to existing series folder\n\n"
+                "💡 Tip: The file will be uploaded to a subfolder inside the series folder",
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+            await query.answer()
+        
+        elif mode == "custom_new":
             # Ask for custom series name (folder selection will show after)
             ACTIVE_SERIES[query.from_user.id] = {
                 'file_list': file_list,
@@ -3922,11 +4054,73 @@ async def handle_callback(client, query):
                 'needs_folder_selection': True  # Flag to show folder selector after name entry
             }
             await query.message.edit_text(
-                "✏️ **Enter Series Name**\n\n"
+                "✏️ **Enter New Series Name**\n\n"
                 "Type the series name and send it as a message.\n\n"
-                "📝 Example: *Harry Potter*\n\n"
-                "After entering the name, you'll choose the upload destination."
+                "📝 Example: *Possessing Violet*\n\n"
             )
+            await query.answer()
+        
+        elif mode == "custom_select":
+            # Show folder browser to select existing series folder
+            user_id = query.from_user.id
+            file_count = len(file_list)
+            
+            PENDING_FOLDER_SELECTION[user_id] = {
+                'file_list': file_list,
+                'series_name': None,  # Will be set to selected folder name
+                'mode': 'series_subfolder',  # Special mode: create subfolder inside selected folder
+                'flat_upload': False,
+                'key': key
+            }
+            
+            # Initialize browser session
+            if user_id not in BROWSER_SESSIONS:
+                BROWSER_SESSIONS[user_id] = {
+                    'current_folder': DRIVE_FOLDER_ID,
+                    'path': [{'name': 'Root', 'id': DRIVE_FOLDER_ID}],
+                    'selected_files': [],
+                    'page': 0
+                }
+            
+            session = BROWSER_SESSIONS[user_id]
+            session['current_folder'] = DRIVE_FOLDER_ID
+            session['path'] = [{'name': 'Root', 'id': DRIVE_FOLDER_ID}]
+            session['page'] = 0
+            
+            # Show folder browser
+            service = get_drive_service()
+            if not service:
+                await query.answer("❌ Drive connection failed", show_alert=True)
+                return
+            
+            folders, _, _ = list_drive_files(service, DRIVE_FOLDER_ID)
+            keyboard = build_folder_selection_keyboard(user_id, folders, DRIVE_FOLDER_ID)
+            
+            await query.message.edit_text(
+                f"📁 **Select Series Folder**\n\n"
+                f"🎯 The file will be uploaded to a subfolder inside the selected series folder\n"
+                f"📊 {file_count} file(s)\n\n"
+                f"Choose the series folder:",
+                reply_markup=keyboard
+            )
+            await query.answer()
+        
+        elif mode == "back_to_options":
+            # Go back to single file options
+            buttons = [
+                [InlineKeyboardButton("📂 Part of a Series", callback_data=f"custom|{key}")],
+                [InlineKeyboardButton("📁 Standalone File", callback_data=f"std|{key}")],
+                [InlineKeyboardButton("🚫 Not an Audiobook", callback_data=f"root|{key}")],
+                [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_selection|{key}")]
+            ]
+            
+            txt = f"📄 **File Received**\n`{file_list[0]['name']}`"
+            if file_list[0]['caption']: 
+                txt += f"\n🏷 **Caption:** `{file_list[0]['caption']}`"
+            txt += "\n\n💡 Choose upload mode:"
+            
+            await query.message.edit_text(txt, reply_markup=InlineKeyboardMarkup(buttons))
+            await query.answer()
         
         await query.answer()
     
@@ -4185,7 +4379,7 @@ async def handle_text(client, message: Message):
 
 # ==================== MAIN ====================
 if __name__ == "__main__":
-    logger.info("🤖 Starting RxUploader...")
+    logger.info("⚡ Starting RxUploader...")
     
     # Create downloads directory
     os.makedirs("downloads", exist_ok=True)
