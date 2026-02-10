@@ -622,6 +622,203 @@ def download_file_from_drive(service, file_id, file_name):
         logger.error(f"Error downloading {file_name}: {e}")
         return None
 
+async def download_file_from_drive_with_progress(service, file_id, file_name, file_size, status_msg, folder_name, idx, total_files, successful, failed):
+    """Download file from Google Drive with real-time progress updates"""
+    try:
+        # Check permissions
+        try:
+            metadata = service.files().get(
+                fileId=file_id,
+                fields="id, name, capabilities",
+                supportsAllDrives=True
+            ).execute()
+            
+            capabilities = metadata.get('capabilities', {})
+            if not capabilities.get('canDownload', True):
+                logger.error(f"❌ No download permission for: {file_name}")
+                return None
+                
+        except HttpError as e:
+            logger.error(f"❌ Cannot access file {file_name}: {e}")
+            return None
+        
+        # Start download
+        request = service.files().get_media(
+            fileId=file_id,
+            supportsAllDrives=True,
+            acknowledgeAbuse=True
+        )
+        
+        download_path = f"downloads/{file_name}"
+        os.makedirs("downloads", exist_ok=True)
+        
+        fh = io.FileIO(download_path, 'wb')
+        downloader = MediaIoBaseDownload(fh, request, chunksize=10*1024*1024)
+        
+        done = False
+        last_update = 0
+        start_time = time.time()
+        last_progress_bytes = 0
+        last_speed_update = start_time
+        
+        while not done:
+            status, done = downloader.next_chunk()
+            
+            if status:
+                progress = int(status.progress() * 100)
+                current_bytes = int(status.progress() * file_size)
+                current_time = time.time()
+                
+                # Update every 2 seconds
+                if current_time - last_update >= 2 or done:
+                    # Calculate speed
+                    time_diff = current_time - last_speed_update
+                    bytes_diff = current_bytes - last_progress_bytes
+                    
+                    if time_diff > 0:
+                        speed = bytes_diff / time_diff
+                    else:
+                        speed = 0
+                    
+                    # Calculate ETA
+                    if speed > 0 and current_bytes < file_size:
+                        remaining_bytes = file_size - current_bytes
+                        eta_seconds = remaining_bytes / speed
+                        eta_str = format_time(eta_seconds)
+                    else:
+                        eta_str = "Done" if done else "Calculating..."
+                    
+                    # Update tracking
+                    last_update = current_time
+                    last_speed_update = current_time
+                    last_progress_bytes = current_bytes
+                    
+                    # Create progress bar
+                    progress_bar = create_progress_bar(progress, length=12)
+                    
+                    # Update status message
+                    await safe_edit_message(
+                        status_msg,
+                        f"📁 **Folder:** {folder_name}\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"📊 Progress: {idx}/{total_files}\n"
+                        f"✅ Sent: {successful} | ❌ Failed: {failed}\n\n"
+                        f"📥 **Downloading:**\n"
+                        f"📄 `{file_name[:45]}...`\n"
+                        f"💾 {format_size(current_bytes)} / {format_size(file_size)}\n\n"
+                        f"{progress_bar}\n"
+                        f"⚡ {format_size(speed)}/s\n"
+                        f"⏱️ ETA: {eta_str}"
+                    )
+        
+        fh.close()
+        logger.info(f"✅ Downloaded: {file_name}")
+        return download_path
+    
+    except HttpError as e:
+        logger.error(f"HTTP Error downloading {file_name}: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Error downloading {file_name}: {e}")
+        return None
+
+async def download_single_file_with_progress(service, file_id, file_name, file_size, status_msg):
+    """Download single file from Google Drive with progress bar"""
+    try:
+        # Check permissions
+        try:
+            metadata = service.files().get(
+                fileId=file_id,
+                fields="id, name, capabilities",
+                supportsAllDrives=True
+            ).execute()
+            
+            capabilities = metadata.get('capabilities', {})
+            if not capabilities.get('canDownload', True):
+                logger.error(f"❌ No download permission for: {file_name}")
+                return None
+                
+        except HttpError as e:
+            logger.error(f"❌ Cannot access file {file_name}: {e}")
+            return None
+        
+        # Start download
+        request = service.files().get_media(
+            fileId=file_id,
+            supportsAllDrives=True,
+            acknowledgeAbuse=True
+        )
+        
+        download_path = f"downloads/{file_name}"
+        os.makedirs("downloads", exist_ok=True)
+        
+        fh = io.FileIO(download_path, 'wb')
+        downloader = MediaIoBaseDownload(fh, request, chunksize=10*1024*1024)
+        
+        done = False
+        last_update = 0
+        start_time = time.time()
+        last_progress_bytes = 0
+        last_speed_update = start_time
+        
+        while not done:
+            status, done = downloader.next_chunk()
+            
+            if status:
+                progress = int(status.progress() * 100)
+                current_bytes = int(status.progress() * file_size)
+                current_time = time.time()
+                
+                # Update every 2 seconds
+                if current_time - last_update >= 2 or done:
+                    # Calculate speed
+                    time_diff = current_time - last_speed_update
+                    bytes_diff = current_bytes - last_progress_bytes
+                    
+                    if time_diff > 0:
+                        speed = bytes_diff / time_diff
+                    else:
+                        speed = 0
+                    
+                    # Calculate ETA
+                    if speed > 0 and current_bytes < file_size:
+                        remaining_bytes = file_size - current_bytes
+                        eta_seconds = remaining_bytes / speed
+                        eta_str = format_time(eta_seconds)
+                    else:
+                        eta_str = "Done" if done else "Calculating..."
+                    
+                    # Update tracking
+                    last_update = current_time
+                    last_speed_update = current_time
+                    last_progress_bytes = current_bytes
+                    
+                    # Create progress bar
+                    progress_bar = create_progress_bar(progress, length=12)
+                    
+                    # Update status message
+                    await safe_edit_message(
+                        status_msg,
+                        f"📥 **Downloading from Drive**\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"📄 `{file_name[:45]}...`\n"
+                        f"💾 {format_size(current_bytes)} / {format_size(file_size)}\n\n"
+                        f"{progress_bar}\n"
+                        f"⚡ {format_size(speed)}/s\n"
+                        f"⏱️ ETA: {eta_str}"
+                    )
+        
+        fh.close()
+        logger.info(f"✅ Downloaded: {file_name}")
+        return download_path
+    
+    except HttpError as e:
+        logger.error(f"HTTP Error downloading {file_name}: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Error downloading {file_name}: {e}")
+        return None
+
 def add_to_queue(file_list, series_name=None, flat_upload=False):
     """Add upload task to queue"""
     global QUEUE_COUNTER
@@ -4209,20 +4406,19 @@ async def handle_text(client, message: Message):
                     filename = file_info['name']
                     file_size = int(file_info.get('size', 0))
                     
-                    # Show download progress for current file
-                    await safe_edit_message(
+                    # Download from Drive with progress bar
+                    local_path = await download_file_from_drive_with_progress(
+                        service, 
+                        file_info['id'], 
+                        filename, 
+                        file_size,
                         status_msg,
-                        f"📁 **Folder:** {file_name}\n"
-                        f"━━━━━━━━━━━━━━━\n"
-                        f"📊 Progress: {idx}/{total_files}\n"
-                        f"✅ Sent: {successful} | ❌ Failed: {failed}\n\n"
-                        f"📥 **Downloading:**\n"
-                        f"📄 `{filename[:45]}...`\n"
-                        f"💾 Size: {format_size(file_size)}"
+                        file_name,
+                        idx,
+                        total_files,
+                        successful,
+                        failed
                     )
-                    
-                    # Download from Drive
-                    local_path = download_file_from_drive(service, file_info['id'], filename)
                     
                     if not local_path:
                         failed += 1
@@ -4300,25 +4496,26 @@ async def handle_text(client, message: Message):
         
         else:
             # Single file download
-            file_size = metadata.get('size', 'Unknown')
+            file_size_int = int(metadata.get('size', 0))
             
-            await status_msg.edit_text(
-                f"📄 **File:** {file_name}\n"
-                f"💾 **Size:** {format_size(file_size)}\n\n"
-                f"⏳ Downloading from Drive..."
+            # Download from Drive with progress bar
+            local_path = await download_single_file_with_progress(
+                service, 
+                file_id, 
+                file_name,
+                file_size_int,
+                status_msg
             )
-            
-            # Download from Drive
-            local_path = download_file_from_drive(service, file_id, file_name)
             
             if not local_path:
                 await status_msg.edit_text(f"❌ Failed to download: {file_name}")
                 return
             
             await status_msg.edit_text(
-                f"📄 **File:** {file_name}\n"
-                f"💾 **Size:** {format_size(file_size)}\n\n"
-                f"⏫ Uploading to Telegram..."
+                f"📤 **Uploading to Telegram**\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"📄 `{file_name[:45]}...`\n"
+                f"💾 Size: {format_size(file_size_int)}"
             )
             
             try:
@@ -4331,15 +4528,15 @@ async def handle_text(client, message: Message):
                     await message.reply_video(local_path)
                 elif is_audio:
                     # Extract metadata for audio files
-                    metadata = extract_audio_metadata(local_path)
+                    metadata_audio = extract_audio_metadata(local_path)
                     thumbnail_path = await extract_audio_thumbnail(local_path)
                     
                     # Send with metadata (no caption)
                     await message.reply_audio(
                         local_path,
-                        title=metadata.get('title'),
-                        performer=metadata.get('performer'),
-                        duration=metadata.get('duration'),
+                        title=metadata_audio.get('title'),
+                        performer=metadata_audio.get('performer'),
+                        duration=metadata_audio.get('duration'),
                         thumb=thumbnail_path
                     )
                     
@@ -4350,13 +4547,13 @@ async def handle_text(client, message: Message):
                         except:
                             pass
                 elif local_path.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
-                    await message.reply_photo(local_path, caption=f"📄 {file_name}\n💾 {format_size(file_size)}")
+                    await message.reply_photo(local_path, caption=f"📄 {file_name}\n💾 {format_size(file_size_int)}")
                 else:
-                    await message.reply_document(local_path, caption=f"📄 {file_name}\n💾 {format_size(file_size)}")
+                    await message.reply_document(local_path, caption=f"📄 {file_name}\n💾 {format_size(file_size_int)}")
                 
                 await status_msg.edit_text(
                     f"✅ **Sent:** {file_name}\n"
-                    f"💾 **Size:** {format_size(file_size)}"
+                    f"💾 **Size:** {format_size(file_size_int)}"
                 )
                 
             except Exception as e:
