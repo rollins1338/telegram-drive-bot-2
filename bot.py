@@ -320,6 +320,52 @@ def get_or_create_folder(service, folder_name, parent_id, retry_count=0, max_ret
         logger.error(f"Critical error in get_or_create_folder for '{folder_name}': {e}")
         return None
 
+def get_folder_path(service, folder_id):
+    """
+    Build complete folder path from folder ID to root
+    Returns path string like "Root -> Romance -> Series -> Book 1"
+    """
+    try:
+        if folder_id == DRIVE_FOLDER_ID:
+            return "Root"
+        
+        path_parts = []
+        current_id = folder_id
+        max_depth = 10  # Prevent infinite loops
+        depth = 0
+        
+        while current_id and current_id != DRIVE_FOLDER_ID and depth < max_depth:
+            try:
+                folder = service.files().get(
+                    fileId=current_id,
+                    fields="id,name,parents"
+                ).execute()
+                
+                path_parts.insert(0, folder.get('name', 'Unknown'))
+                
+                # Get parent folder ID
+                parents = folder.get('parents', [])
+                if parents:
+                    current_id = parents[0]
+                else:
+                    break
+                    
+                depth += 1
+                
+            except Exception as e:
+                logger.error(f"Error getting folder info for {current_id}: {e}")
+                break
+        
+        # Build path string
+        if path_parts:
+            return "Root -> " + " -> ".join(path_parts)
+        else:
+            return "Root"
+            
+    except Exception as e:
+        logger.error(f"Error building folder path: {e}")
+        return "Root"
+
 def clean_series_name(filename):
     """
     IMPROVED: Extract clean series name from filename
@@ -930,22 +976,6 @@ def get_breadcrumb(session):
     """Get breadcrumb navigation path"""
     path_parts = [p['name'] for p in session['path']]
     return " > ".join(path_parts)
-
-async def safe_edit_message(message, text, reply_markup=None):
-    """
-    Safely edit a message, handling MessageNotModified errors
-    """
-    try:
-        if reply_markup:
-            await message.edit_text(text, reply_markup=reply_markup)
-        else:
-            await message.edit_text(text)
-    except MessageNotModified:
-        # Message content is the same, silently ignore
-        pass
-    except Exception as e:
-        logger.error(f"Error editing message: {e}")
-        raise
 
 def create_progress_bar(progress, length=10):
     """
@@ -2002,7 +2032,7 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
             'lock': asyncio.Lock(),
             'active_workers': [],
             'stop_updater': False,
-            'folders_created': set()  # Track actual folder names created
+            'upload_folders': set()  # Track all folder IDs where files are saved
         }
         
         # Create queue for files
@@ -2129,10 +2159,6 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
                                     raise Exception("Failed to create file folder")
                                 
                                 upload_folder = file_folder
-                                
-                                # Track folder name for final message
-                                async with upload_state['lock']:
-                                    upload_state['folders_created'].add(folder_name)
                             
                             # Upload to Drive
                             file_metadata = {
@@ -2222,6 +2248,9 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
                                 upload_state['successful_uploads'] += 1
                                 upload_state['total_size_uploaded'] += uploaded_size
                                 upload_state['completed'] += 1
+                                
+                                # Track where this file was uploaded
+                                upload_state['upload_folders'].add(upload_folder)
                                 
                                 # Update global stats
                                 global TOTAL_FILES, TOTAL_BYTES
@@ -2387,21 +2416,29 @@ async def upload_task(client: Client, status_msg: Message, file_list: list, seri
         # Final status
         elapsed_time = time.time() - start_time
         
-        # Determine location text based on actual folders created
-        if flat_upload:
-            location_text = "Root (No Folders)"
-        elif series_name:
-            location_text = f"**{series_name}**"
+        # Determine location text based on actual upload folders
+        upload_folders = upload_state['upload_folders']
+        
+        if len(upload_folders) == 0:
+            location_text = "Root"
+        elif len(upload_folders) == 1:
+            # Single folder - show complete path
+            folder_id = list(upload_folders)[0]
+            location_text = get_folder_path(service, folder_id)
         else:
-            # Show actual folders created for standalone uploads
-            folders_list = sorted(upload_state['folders_created'])
-            if folders_list:
-                if len(folders_list) == 1:
-                    location_text = f"Root -> **{folders_list[0]}**"
-                else:
-                    location_text = f"Root -> Multiple Folders ({len(folders_list)})"
+            # Multiple folders - show all paths
+            paths = []
+            for folder_id in sorted(upload_folders):
+                path = get_folder_path(service, folder_id)
+                paths.append(path)
+            
+            # If 2-3 folders, show all paths
+            if len(paths) <= 3:
+                location_text = "\n     ".join(paths)  # Indent continuation lines
             else:
-                location_text = "Root"
+                # Too many folders, show summary
+                common_parent = paths[0].rsplit(' -> ', 1)[0] if ' -> ' in paths[0] else "Root"
+                location_text = f"{common_parent} -> Multiple Folders ({len(upload_folders)})"
         
         status_text = (
             f"✅ **Upload Complete!**\n"
@@ -2479,7 +2516,8 @@ async def start_command(client, message):
         "**📥 Download from Drive**\n"
         "Send Drive link → Get files instantly\n"
         "• Single files ✅\n"
-        "• Entire folders ✅\n\n"
+        "• Entire folders ✅\n"
+        "• Progress tracking ✅\n\n"
         "**⚙️ Commands**\n"
         "/stats - View statistics\n"
         "/queue - Check upload queue\n"
@@ -3351,6 +3389,12 @@ async def handle_callback(client, query):
                 await query.answer("❌ Failed to connect to Drive", show_alert=True)
                 return
             
+            # FIXED: Initialize browser session properly
+            session = get_browser_session(user_id)
+            session['current_folder'] = DRIVE_FOLDER_ID
+            session['path'] = [{'name': 'My Drive', 'id': DRIVE_FOLDER_ID}]
+            session['page'] = 0
+            
             folders, _, _ = list_drive_files(service, DRIVE_FOLDER_ID)
             keyboard = build_folder_selection_keyboard(user_id, folders, DRIVE_FOLDER_ID)
             
@@ -4162,48 +4206,75 @@ async def handle_text(client, message: Message):
             
             for idx, file_info in enumerate(files, 1):
                 try:
-                    # Update status every 5 files
-                    if idx % 5 == 0 or idx == 1:
-                        await status_msg.edit_text(
-                            f"📁 **Folder:** {file_name}\n"
-                            f"📊 Progress: {idx}/{total_files}\n"
-                            f"📄 Current: `{file_info['name'][:40]}...`\n"
-                            f"✅ Sent: {successful} | ❌ Failed: {failed}"
-                        )
+                    filename = file_info['name']
+                    file_size = int(file_info.get('size', 0))
+                    
+                    # Show download progress for current file
+                    await safe_edit_message(
+                        status_msg,
+                        f"📁 **Folder:** {file_name}\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"📊 Progress: {idx}/{total_files}\n"
+                        f"✅ Sent: {successful} | ❌ Failed: {failed}\n\n"
+                        f"📥 **Downloading:**\n"
+                        f"📄 `{filename[:45]}...`\n"
+                        f"💾 Size: {format_size(file_size)}"
+                    )
                     
                     # Download from Drive
-                    local_path = download_file_from_drive(service, file_info['id'], file_info['name'])
+                    local_path = download_file_from_drive(service, file_info['id'], filename)
                     
                     if not local_path:
                         failed += 1
                         continue
                     
+                    # Show upload progress
+                    await safe_edit_message(
+                        status_msg,
+                        f"📁 **Folder:** {file_name}\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"📊 Progress: {idx}/{total_files}\n"
+                        f"✅ Sent: {successful} | ❌ Failed: {failed}\n\n"
+                        f"📤 **Uploading to Telegram:**\n"
+                        f"📄 `{filename[:45]}...`\n"
+                        f"💾 Size: {format_size(file_size)}"
+                    )
+                    
                     # Send to Telegram based on file type
-                    file_size = int(file_info.get('size', 0))
                     is_audio = local_path.lower().endswith(('.mp3', '.m4a', '.m4b', '.flac', '.wav', '.ogg', '.aac', '.opus'))
                     is_video = local_path.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm'))
-                    
-                    # Set caption based on file type
-                    if is_video:
-                        caption = None  # No caption for videos
-                    elif is_audio:
-                        caption = f"📖 {file_name}"  # Book emoji with folder name for audio
-                    else:
-                        caption = f"📁 {file_name}\n📄 {file_info['name']}\n💾 {format_size(file_size)}"
                     
                     try:
                         if is_video:
                             await message.reply_video(local_path)
                         elif is_audio:
-                            await message.reply_audio(local_path, caption=caption)
+                            # Extract metadata for audio files
+                            metadata = extract_audio_metadata(local_path)
+                            thumbnail_path = await extract_audio_thumbnail(local_path)
+                            
+                            # Send with metadata (no caption)
+                            await message.reply_audio(
+                                local_path,
+                                title=metadata.get('title'),
+                                performer=metadata.get('performer'),
+                                duration=metadata.get('duration'),
+                                thumb=thumbnail_path
+                            )
+                            
+                            # Clean up thumbnail
+                            if thumbnail_path and os.path.exists(thumbnail_path):
+                                try:
+                                    os.remove(thumbnail_path)
+                                except:
+                                    pass
                         elif local_path.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
-                            await message.reply_photo(local_path, caption=caption)
+                            await message.reply_photo(local_path, caption=f"📁 {file_name}\n📄 {filename}\n💾 {format_size(file_size)}")
                         else:
-                            await message.reply_document(local_path, caption=caption)
+                            await message.reply_document(local_path, caption=f"📁 {file_name}\n📄 {filename}\n💾 {format_size(file_size)}")
                         
                         successful += 1
                     except Exception as e:
-                        logger.error(f"Error sending {file_info['name']}: {e}")
+                        logger.error(f"Error sending {filename}: {e}")
                         failed += 1
                     
                     # Clean up
@@ -4259,8 +4330,25 @@ async def handle_text(client, message: Message):
                     # No caption for videos
                     await message.reply_video(local_path)
                 elif is_audio:
-                    # Simple filename caption for standalone audio
-                    await message.reply_audio(local_path, caption=file_name)
+                    # Extract metadata for audio files
+                    metadata = extract_audio_metadata(local_path)
+                    thumbnail_path = await extract_audio_thumbnail(local_path)
+                    
+                    # Send with metadata (no caption)
+                    await message.reply_audio(
+                        local_path,
+                        title=metadata.get('title'),
+                        performer=metadata.get('performer'),
+                        duration=metadata.get('duration'),
+                        thumb=thumbnail_path
+                    )
+                    
+                    # Clean up thumbnail
+                    if thumbnail_path and os.path.exists(thumbnail_path):
+                        try:
+                            os.remove(thumbnail_path)
+                        except:
+                            pass
                 elif local_path.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
                     await message.reply_photo(local_path, caption=f"📄 {file_name}\n💾 {format_size(file_size)}")
                 else:
@@ -4311,6 +4399,13 @@ async def handle_text(client, message: Message):
             if key in TEMP_FILES:
                 del TEMP_FILES[key]
             return
+        
+        # FIXED: Initialize browser session properly BEFORE building keyboard
+        session = get_browser_session(user_id)
+        # Reset to root folder
+        session['current_folder'] = DRIVE_FOLDER_ID
+        session['path'] = [{'name': 'My Drive', 'id': DRIVE_FOLDER_ID}]
+        session['page'] = 0
         
         folders, _, _ = list_drive_files(service, DRIVE_FOLDER_ID)
         keyboard = build_folder_selection_keyboard(user_id, folders, DRIVE_FOLDER_ID)
