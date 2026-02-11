@@ -896,7 +896,9 @@ def list_drive_files(service, folder_id, page_token=None):
             pageSize=100,
             pageToken=page_token,
             fields="nextPageToken, files(id, name, mimeType, size, modifiedTime, parents)",
-            orderBy="folder,name"
+            orderBy="folder,name",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
         ).execute()
         
         items = results.get('files', [])
@@ -920,7 +922,8 @@ def get_folder_info(service, folder_id):
         
         file = service.files().get(
             fileId=folder_id,
-            fields="id, name, parents"
+            fields="id, name, parents",
+            supportsAllDrives=True
         ).execute()
         
         return file
@@ -941,7 +944,9 @@ def search_drive_files(service, query, folder_id=None):
             q=search_query,
             pageSize=50,
             fields="files(id, name, mimeType, size, modifiedTime, parents)",
-            orderBy="folder,name"
+            orderBy="folder,name",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
         ).execute()
         
         items = results.get('files', [])
